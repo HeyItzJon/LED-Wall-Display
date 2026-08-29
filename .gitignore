@@ -1,0 +1,46 @@
+# Arduino IDE
+*.o
+*.a
+*.so
+build/
+dist/
+
+# Arduino sketch build artifacts
+applet/
+__MACOSX/
+
+# User-specific Arduino settings
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Compiled binary files
+*.hex
+*.elf
+*.bin
+
+# Build output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE files
+*.sublime-project
+*.sublime-workspace
+.idea/
+*.code-workspace
+
+# Node/npm (if using Node in scripts)
+node_modules/
+npm-debug.log
+package-lock.json
+
+# Temporary files
+*.tmp
+*.log
+temp/
