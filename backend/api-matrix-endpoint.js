@@ -1,29 +1,64 @@
 /**
- * ADD THIS TO backend/server.js in the "reading" section, after /api/display
+ * This is a REFERENCE COPY of the /api/matrix route that actually lives in
+ * pi-secretary/backend/server.js (in the "reading" section, after
+ * /api/display). If you ever need to restore or diff it, this is what
+ * should be there — but server.js is the source of truth; edit it there,
+ * then update this file to match, not the other way around.
  */
 
 /**
- * Slim endpoint for the ESP32 LED wall. Returns only the data needed for the
- * 4 display pages (Portfolio, Events, Holdings, Offline), ~1-2KB JSON.
+ * Slim endpoint for the ESP32 LED wall. Returns everything the firmware's
+ * pages need — ticker (markets + top movers), today's events, top holdings —
+ * ~2-3KB JSON. Polled every 30 seconds from the ESP32 over WiFi.
  *
- * Polled every 30 seconds from the ESP32 over WiFi, so payloads must be small
- * and structure must be flat/simple (no parsing complexity on the microcontroller).
+ * IMPORTANT: this endpoint makes ZERO external API calls of its own. Every
+ * field below is read straight out of meta blobs that the regular 15-minute
+ * pull cycle (runSources → collectMoney / collectMarketNews) already wrote:
+ *   - moneySummary.positions[].dayChangePct → gainers/losers
+ *   - marketPulse.indices[].pct             → TSX/NASDAQ/S&P ticker line
+ * If you want fresher numbers, raise config.schedule.pullEveryMinutes rather
+ * than adding a fetch here — this route just reads what's already cached.
  */
 app.get("/api/matrix", async (_req, res) => {
   try {
     const now = new Date();
-    const [items, money, brief] = await Promise.all([
+    const [items, money, marketPulse, brief] = await Promise.all([
       allItems(),
       getMeta("moneySummary", null),
+      getMeta("marketPulse", null),
       getMeta("lastBrief", null),
     ]);
 
     // Portfolio: total value, day change ($), day change (%)
-    const portfolio = money ? {
-      total: money.total || 0,
-      dayChange: money.dayValue || 0,
-      dayChangePercent: money.dayPercent || 0,
-    } : null;
+    const portfolio = money
+      ? {
+          total: Math.round((money.total || 0) * 100) / 100,
+          dayChange: Math.round((money.dayChangeValue || 0) * 100) / 100,
+          dayChangePercent: Math.round((money.dayPct || 0) * 100) / 100,
+        }
+      : null;
+
+    // Market indices (TSX / NASDAQ / S&P) — from marketPulse, refreshed by
+    // sources/marketNews.js on the same 15-minute cycle. No fetch here.
+    const shortLabel = (label) => (label === "S&P 500" ? "S&P" : label.toUpperCase());
+    const markets = (marketPulse?.indices || [])
+      .filter((i) => i.pct != null)
+      .map((i) => ({
+        symbol: shortLabel(i.label),
+        changePercent: Math.round(i.pct * 100) / 100,
+      }));
+
+    // Top 3 gainers / losers by TODAY's move, from the positions the money
+    // source already priced this pull — same dayChangePct the Finances page
+    // shows on each holding row.
+    const movers = (money?.positions || [])
+      .filter((p) => p.dayChangePct != null)
+      .map((p) => ({
+        symbol: p.ticker.replace(/\.(TO|V|NE|CN)$/i, ""),
+        changePercent: Math.round(p.dayChangePct * 100) / 100,
+      }));
+    const gainers = [...movers].sort((a, b) => b.changePercent - a.changePercent).slice(0, 3);
+    const losers = [...movers].sort((a, b) => a.changePercent - b.changePercent).slice(0, 3);
 
     // Events: today's events only, with busy level
     const today = new Intl.DateTimeFormat("en-CA", {
@@ -50,18 +85,18 @@ app.get("/api/matrix", async (_req, res) => {
       ? money.positions.slice(0, 5).map((p) => ({
           symbol: p.ticker.replace(/\.(TO|V|NE|CN)$/i, ""),
           value: Math.round(p.value || 0),
-          dayChangePercent: p.dayPercent || 0,
-          weightPercent: Math.round(((p.value || 0) / (money.total || 1)) * 1000) / 10,
+          dayChangePercent: p.dayChangePct || 0,
+          weightPercent: Math.round((p.weightPct || 0) * 10) / 10,
         }))
       : [];
 
-    // Last refresh timestamp (for offline detection on ESP32)
-    const lastRefresh = money?.at || null;
-
     res.json({
       timestamp: now.getTime(),
-      lastRefresh,
+      lastRefresh: money?.at || null,
       portfolio,
+      markets, // TSX, NASDAQ, S&P with % change
+      gainers, // Top 3 holdings up today
+      losers, // Top 3 holdings down today
       events: todayEvents,
       dailyBusyPercent,
       holdings,

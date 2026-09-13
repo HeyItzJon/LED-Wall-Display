@@ -92,7 +92,7 @@ See `docs/IMPLEMENTATION.md` Part 3 for complete wiring guide:
 ## Features
 
 ✅ **3 Display Pages (auto-rotate every 30s):**
-- Portfolio Overview (total value, day change)
+- Market Ticker (scrolling TSX/NASDAQ/S&P + top 3 holdings gainers/losers, mixed, with a portfolio side panel)
 - Today's Events (with busy-level indicators)
 - Top Holdings (cycles through top 5)
 
@@ -176,6 +176,11 @@ Optional:
 
 **Endpoint:** `GET /api/matrix`
 
+Makes zero external API calls — every field is read from the meta blobs the
+15-minute pull cycle already wrote (`moneySummary`, `marketPulse`). See the
+comment at the top of `backend/api-matrix-endpoint.js` for exactly which
+cached field feeds which JSON field.
+
 **Response (sample):**
 ```json
 {
@@ -186,6 +191,17 @@ Optional:
     "dayChange": 1250.75,
     "dayChangePercent": 1.01
   },
+  "markets": [
+    { "symbol": "TSX", "changePercent": 0.42 },
+    { "symbol": "NASDAQ", "changePercent": -0.18 },
+    { "symbol": "S&P", "changePercent": 0.31 }
+  ],
+  "gainers": [
+    { "symbol": "AAPL", "changePercent": 2.3 }
+  ],
+  "losers": [
+    { "symbol": "META", "changePercent": -1.4 }
+  ],
   "events": [
     {
       "time": "10:00",

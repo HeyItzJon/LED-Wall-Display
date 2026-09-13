@@ -9,18 +9,24 @@
 
 ## Display Layout & Mockups
 
-### Page 1: Portfolio Overview
+### Page 1: Market Ticker (scrolling)
 ```
-┌──────────────────────────────────────────────────────┐
-│  PORTFOLIO                                            │
-│  $[Total Value]         [+/- $]  [+/- %]            │
-│                                                      │
-│  [Simple bar or sparkline of day's movement]        │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────┬─────────┐
+│ +0.4% TSX | -0.1% NASDAQ | +0.3% S&P  |    │   ^     │
+│  +2.3% AAPL | -1.4% META | +0.8% MSFT ...  │  HOLD   │
+│  ←—— continuously scrolling, seamless loop  │ +1.0%   │
+│                                              │  $+825  │
+└────────────────────────────────────────────┴─────────┘
 ```
-- **Data:** Portfolio total value, day change ($), day change (%), intraday sparkline (optional)
-- **Font:** Medium/large for readability
-- **Static:** No scrolling
+- **Left (150px):** Continuous scrolling ticker — percent first, then symbol
+  (`+2.5% TSX`). Markets (TSX/NASDAQ/S&P) first, then a gap, then the top 3
+  holdings gainers and top 3 losers sprinkled together (not sequential
+  blocks). Loops seamlessly — a second copy is drawn right behind the first.
+- **Right (40px):** Portfolio side panel — up/down indicator (^ or v,
+  green/red), "HOLD" label, day %, day $.
+- **Font:** Small (textSize 1) for the ticker, size 2 for the indicator.
+- **Dynamic:** Scrolls 2px every 50ms, independent of the 30s page rotation
+  and the 30s data poll — the scroll never stalls waiting on either.
 
 ### Page 2: Events Timeline
 ```
@@ -79,6 +85,13 @@
 
 **Purpose:** Slim, real-time data for the LED wall (no full page payload, just the numbers)
 
+**Zero external API calls.** Every field is read from meta blobs the regular
+15-minute pull cycle already wrote — `moneySummary` (money.js) and
+`marketPulse` (marketNews.js). See the header comment in
+`backend/api-matrix-endpoint.js` for exactly which cached field feeds which
+JSON field. Want fresher numbers? Raise `config.schedule.pullEveryMinutes` —
+don't add a fetch to this route.
+
 **Response:**
 ```json
 {
@@ -89,6 +102,17 @@
     "dayChange": 1250.75,
     "dayChangePercent": 1.01
   },
+  "markets": [
+    { "symbol": "TSX", "changePercent": 0.42 },
+    { "symbol": "NASDAQ", "changePercent": -0.18 },
+    { "symbol": "S&P", "changePercent": 0.31 }
+  ],
+  "gainers": [
+    { "symbol": "AAPL", "changePercent": 2.3 }
+  ],
+  "losers": [
+    { "symbol": "META", "changePercent": -1.4 }
+  ],
   "events": [
     {
       "time": "10:00",
@@ -113,7 +137,7 @@
 }
 ```
 
-**Payload size:** ~1-2KB (vs. full `/api/display` which is much larger)
+**Payload size:** ~2-3KB (vs. full `/api/display` which is much larger)
 
 ---
 
@@ -135,7 +159,7 @@
    - Render current page data
 
 4. **Renderers** (one per page)
-   - Portfolio Overview → render static stats
+   - Market Ticker → scroll ticker text + render portfolio side panel
    - Events Timeline → render events + busy bar
    - Portfolio Detail → render rotating holdings
    - Offline → render error message
