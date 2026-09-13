@@ -126,9 +126,10 @@ unsigned long lastCommandFetchAttempt = 0;
 #define FORCE_SCREEN ""
 
 // ---- Data model: /api/matrix ----
-#define MAX_EVENTS 8
+#define MAX_EVENTS 12
 #define MAX_HOLDINGS 8
 #define MAX_NEWS 6
+#define MAX_MARKETS 6
 
 struct EventItem {
   String time;
@@ -148,9 +149,28 @@ int numHoldings = 0;
 String newsHeadlines[MAX_NEWS];
 int numNews = 0;
 
+// Market indices (S&P 500 / Nasdaq / TSX / Dow / Russell 2000 today) and
+// VIX — round 74. Both ride the same marketPulse blob backend/server.js
+// already builds; this is the first time the firmware has anywhere to
+// put them (a real Markets screen, see buildMarketsStrip() below,
+// instead of the renderComingSoonFwd placeholder).
+struct MarketIdx { String symbol; float changePercent; };
+MarketIdx markets[MAX_MARKETS];
+int numMarkets = 0;
+bool hasVix = false;
+float vixValue = 0;
+String vixBucket = ""; // "calm" | "normal" | "jumpy" | "volatile"
+
 float portfolioTotal = 0, portfolioDayChange = 0, portfolioDayChangePercent = 0;
 int dailyBusyPercent = 0;
 bool hasMarketOpen = false, marketOpen = false;
+
+// Round 74 — Jon: "so we know that these prices... are not current, and
+// they are the last known price." Compact day+time string from
+// server.js's formatLastPriceLabel(), e.g. "FRI 4:00PM" — only
+// non-empty when the market is closed. Spliced into the Holdings
+// ticker's MARKET CLOSED TODAY banner, see buildHoldingsStrip() below.
+String lastPriceLabel = "";
 
 // Day Overview extra fields — NOT sent by the backend yet (only
 // dailyBusyPercent and the event count are real today). Never fabricated:
@@ -842,7 +862,10 @@ void pollData() {
 
   if (code == 200) {
     String payload = http.getString();
-    DynamicJsonDocument doc(6144);
+    // Bumped 6144 -> 10240 for round 74: markets[]/vix/lastPriceLabel are
+    // new fields, MAX_EVENTS grew 8->12, and news headlines are no longer
+    // truncated server-side (up to ~90 chars each now instead of 60).
+    DynamicJsonDocument doc(10240);
     DeserializationError err = deserializeJson(doc, payload);
 
     if (!err) {
@@ -856,6 +879,23 @@ void pollData() {
 
       hasMarketOpen = doc.containsKey("marketOpen");
       if (hasMarketOpen) marketOpen = doc["marketOpen"].as<bool>();
+      lastPriceLabel = doc["lastPriceLabel"] | "";
+
+      numMarkets = 0;
+      if (doc.containsKey("markets")) {
+        for (JsonVariant v : doc["markets"].as<JsonArray>()) {
+          if (numMarkets >= MAX_MARKETS) break;
+          markets[numMarkets].symbol        = v["symbol"] | "";
+          markets[numMarkets].changePercent = v["changePercent"] | 0.0;
+          numMarkets++;
+        }
+      }
+
+      hasVix = doc.containsKey("vix") && !doc["vix"].isNull();
+      if (hasVix) {
+        vixValue  = doc["vix"]["value"] | 0.0;
+        vixBucket = doc["vix"]["bucket"] | "";
+      }
 
       numEvents = 0;
       if (doc.containsKey("events")) {
@@ -921,8 +961,8 @@ void pollData() {
         }
       }
 
-      Serial.printf("Data OK — total $%.2f, %d events, %d holdings, %d news\n",
-                    portfolioTotal, numEvents, numHoldings, numNews);
+      Serial.printf("Data OK — total $%.2f, %d events, %d holdings, %d news, %d markets\n",
+                    portfolioTotal, numEvents, numHoldings, numNews, numMarkets);
     } else {
       Serial.printf("JSON parse error on /api/matrix: %s\n", err.c_str());
     }
@@ -1087,17 +1127,30 @@ uint16_t busyScoreColor(int score) {
   return dma_display->color565(255, 70, 60);
 }
 
-// Real calendar colors matching the website's calendarSwatch() palette —
-// used once the backend starts sending a per-event "cal" field (see
-// handoff doc). Until then, calColorFallback() below covers busyLevel.
+// Real calendar colors — ported from the website's actual calendarSwatch()
+// categories (frontend/src/Display.css's .d-* rules), not the placeholder
+// 6-category set this used to guess at (work/school/personal/important/
+// cannotmiss/tests — none of which are Jon's real config.json categories,
+// which is exactly why every event rendered in the same default blue;
+// round 74 — Jon: "the colors are not correct. They are all showing
+// blue... but some of them are on different calendars"). Each hex value
+// below is Display.css's real color run through an HSV saturation/value
+// boost (round 74 — Jon: "brighten/saturate for the LED") since the
+// website's palette is tuned for readability on a light page background,
+// not a small low-resolution LED matrix.
 uint16_t calColor(const String &cal) {
-  if (cal == "work") return dma_display->color565(255, 90, 70);
-  if (cal == "school") return dma_display->color565(70, 200, 110);
-  if (cal == "personal") return dma_display->color565(90, 180, 255);
-  if (cal == "important") return dma_display->color565(190, 120, 230);
-  if (cal == "cannotmiss") return dma_display->color565(255, 160, 40);
-  if (cal == "tests") return dma_display->color565(230, 195, 60);
-  return dma_display->color565(90, 180, 255); // default: personal blue
+  if (cal == "critical")    return dma_display->color565(208, 90, 0);   // css #b5560d
+  if (cal == "opportunity") return dma_display->color565(0, 191, 156);  // css #12806c
+  if (cal == "assessment")  return dma_display->color565(191, 147, 0);  // css #9c7a0a
+  if (cal == "important")   return dma_display->color565(110, 30, 199); // css #7440ad
+  if (cal == "work")        return dma_display->color565(223, 15, 0);   // css #c22a1f
+  if (cal == "family")      return dma_display->color565(38, 45, 221);  // css #4a4fc0
+  if (cal == "deadline")    return dma_display->color565(193, 44, 0);   // css #a83c1c
+  if (cal == "class")       return dma_display->color565(0, 191, 63);   // css #1f7a3d
+  if (cal == "admin")       return dma_display->color565(85, 137, 191); // css #40566d
+  if (cal == "appointment") return dma_display->color565(10, 152, 191); // css #276f83
+  if (cal == "gmail")       return dma_display->color565(0, 113, 193);  // css #1f6fa8
+  return dma_display->color565(191, 185, 7); // css #767322 — "personal", also the fallback category
 }
 
 // Fallback for events that don't have a "cal" field yet — reuses the
@@ -1145,6 +1198,27 @@ void computeEventPlan(int capMaxW, EventPlan *plan) {
     unsigned long durDesc = textRequiredTime(plan[i].descOverflow);
     plan[i].dur = max((unsigned long)EVENT_MIN_HOLD, max(durCap, durDesc));
   }
+}
+
+// How long the Events screen needs to stay up to cycle through every event
+// at least once. renderEvents() below picks the current event from
+// `elapsed % cycle` over ALL numEvents events, but until round 74 nothing
+// extended the screen's rotation slot to match that full cycle length —
+// unlike News/Holdings, which have had this since round 59/61 — so a day
+// with several events got cut off partway through instead of showing all
+// of them (round 74 — Jon: "If there's ten events, we gotta go through
+// all of them, get all of their metadata before this page disappears").
+// Recomputes the same plan computeEventPlan() builds so this can never
+// drift out of sync with what renderEvents() actually cycles through.
+unsigned long eventsRequiredTime() {
+  if (numEvents == 0) return 0;
+  const int barX0 = 2; // must match renderEvents()'s margin
+  int capMaxW = W - barX0 - 2;
+  EventPlan plan[MAX_EVENTS];
+  computeEventPlan(capMaxW, plan);
+  unsigned long cycle = 0;
+  for (int i = 0; i < numEvents; i++) cycle += plan[i].dur;
+  return cycle;
 }
 
 void renderEvents(unsigned long elapsed) {
@@ -1250,7 +1324,13 @@ int buildHoldingsStrip(StripCmd *cmds, int maxCmds) {
   // already parses off /api/matrix, so no new JSON field is needed, and
   // it's plain-text same size as the rest of the ticker — just red.
   if (hasMarketOpen && !marketOpen) {
-    addText("MARKET CLOSED TODAY", dma_display->color565(255, 20, 20));
+    // Round 74 — Jon: "next to it in the same size font... LAST PRICE...
+    // so we know these prices... are not current." Kept in the same
+    // addText() call (no bar between them) so it reads as one red
+    // disclaimer instead of two separately-boxed ticker segments.
+    String closedText = "MARKET CLOSED TODAY";
+    if (lastPriceLabel.length() > 0) closedText += "   LAST PRICE: " + lastPriceLabel;
+    addText(closedText, dma_display->color565(255, 20, 20));
     addBar();
   }
   if (numHoldings == 0) {
@@ -1358,6 +1438,81 @@ void renderHoldingsTicker(unsigned long elapsed) {
   // the scrolling right away" — no separate static pause needed).
   // startShift must match holdingsRequiredTime()'s, which is what decides
   // how long this screen stays up.
+  const float startShift = (W / 2.0f) - 6;
+  float offset = -startShift + elapsed * speedPxPerMs;
+  for (int i = 0; i < n; i++) drawStripCmd(cmds[i], cmds[i].x - offset);
+}
+
+// Round 74 — Markets screen: same single-pass, centered-start ticker as
+// Holdings (buildHoldingsStrip/holdingsRequiredTime/renderHoldingsTicker
+// above), just a different strip: the tracked indices' % change, then
+// VIX colored by its own calm/normal/jumpy/volatile bucket instead of a
+// directional up/down color (VIX doesn't have an "up is good" reading).
+uint16_t vixColorFor(const String &bucket) {
+  if (bucket == "calm") return dma_display->color565(0, 255, 80);
+  if (bucket == "jumpy") return dma_display->color565(255, 160, 0);
+  if (bucket == "volatile") return dma_display->color565(255, 40, 40);
+  return dma_display->color565(255, 255, 255); // normal
+}
+
+int buildMarketsStrip(StripCmd *cmds, int maxCmds) {
+  int n = 0;
+  int x = 6;
+  const int GAP = 12, size = TICKER_TEXT_SIZE, rowY = (H - 8 * size) / 2;
+  const int barH = 8 * size;
+  auto addText = [&](String text, uint16_t color) {
+    if (n >= maxCmds) return;
+    cmds[n++] = { false, x, rowY, 0, 0, text, 0, color };
+    x += (int)text.length() * 6 * size + GAP;
+  };
+  auto addBar = [&]() {
+    if (n >= maxCmds) return;
+    cmds[n++] = { false, x, rowY, 3, barH, "", 0, dma_display->color565(120, 170, 255) };
+    x += 3 + GAP;
+  };
+  addText("MARKETS", dma_display->color565(0, 200, 255));
+  addBar();
+  if (numMarkets == 0 && !hasVix) {
+    addText("NO MARKET DATA", dma_display->color565(150, 150, 150));
+  } else {
+    for (int i = 0; i < numMarkets; i++) {
+      bool up = markets[i].changePercent >= 0;
+      uint16_t color = up ? dma_display->color565(0, 255, 80) : dma_display->color565(255, 60, 60);
+      addText(markets[i].symbol, dma_display->color565(255, 255, 255));
+      addText(formatSignedPercent(markets[i].changePercent), color);
+      addBar();
+    }
+    if (hasVix) {
+      addText("VIX", dma_display->color565(255, 255, 255));
+      addText(String(vixValue, 1), vixColorFor(vixBucket));
+      addBar();
+    }
+  }
+  return n;
+}
+
+// Same math as holdingsRequiredTime() — see its comment for why this
+// isn't just the fixed ROTATION_MS slot.
+unsigned long marketsRequiredTime() {
+  StripCmd cmds[40];
+  int n = buildMarketsStrip(cmds, 40);
+  int totalWidth = 6;
+  for (int i = 0; i < n; i++) {
+    int end = cmds[i].x + (cmds[i].w > 0 && cmds[i].text.length() == 0 ? cmds[i].w : (int)cmds[i].text.length() * 6 * TICKER_TEXT_SIZE);
+    if (end > totalWidth) totalWidth = end;
+  }
+  const float speedPxPerMs = 0.05f; // must match renderMarketsTicker's speed
+  const float startShift = (W / 2.0f) - 6; // must match renderMarketsTicker
+  const int exitMargin = 20;
+  float totalScrollDistance = startShift + totalWidth + exitMargin;
+  return (unsigned long)(totalScrollDistance / speedPxPerMs);
+}
+
+void renderMarketsTicker(unsigned long elapsed) {
+  dma_display->clearScreen();
+  StripCmd cmds[40];
+  int n = buildMarketsStrip(cmds, 40);
+  const float speedPxPerMs = 0.05f;
   const float startShift = (W / 2.0f) - 6;
   float offset = -startShift + elapsed * speedPxPerMs;
   for (int i = 0; i < n; i++) drawStripCmd(cmds[i], cmds[i].x - offset);
@@ -1770,6 +1925,7 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   if (id == "portfolio") renderPortfolio(now);
   else if (id == "events") renderEvents(screenElapsed);
   else if (id == "holdings") renderHoldingsTicker(screenElapsed);
+  else if (id == "markets") renderMarketsTicker(screenElapsed);
   else if (id == "news") renderNews(screenElapsed);
   else if (id == "clock") renderClock();
   else if (id == "dayoverview") renderDayOverview();
@@ -1777,7 +1933,7 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "stars") renderStars(screenElapsed);
   else if (id == "balls") renderBalls(screenElapsed);
   else if (id == "alerts") renderAlert(now);
-  else renderComingSoonFwd(id, now); // markets, weather, and anything unrecognized
+  else renderComingSoonFwd(id, now); // weather, and anything unrecognized
 }
 
 // ============================================================
@@ -1932,16 +2088,23 @@ void loop() {
       unsigned long needed = max((unsigned long)ROTATION_MS, holdingsRequiredTime());
       if (now - currentScreenStart < needed) targetId = "holdings";
     }
-    // Events was observed flashing for under a second instead of its
-    // normal 12s slot (round 73 — Jon: "lasts for about one second on
-    // screen"). Nothing in renderEvents() shortens it on purpose — this is
-    // a floor, not an extension like News/Holdings above, guaranteeing it
-    // can never get less than a full ROTATION_MS once shown, whatever
-    // transient condition (an activeScreens-list reshuffle mid-cycle is
-    // the leading suspect) caused the short flash. Applies whether the
-    // screen is showing "NO EVENTS TODAY" or a real event.
+    // Markets ticker — same extension as Holdings above (round 74).
+    if (currentScreenId == "markets" && targetId != "markets") {
+      unsigned long needed = max((unsigned long)ROTATION_MS, marketsRequiredTime());
+      if (now - currentScreenStart < needed) targetId = "markets";
+    }
+    // Events: round 73 added a bare ROTATION_MS floor after it was observed
+    // flashing for under a second ("lasts for about one second on
+    // screen"). Round 74 replaces that floor with a real extension, same
+    // shape as News/Holdings above — eventsRequiredTime() is the actual
+    // time needed to cycle through every event at least once (Jon: "if
+    // there's ten events, we gotta go through all of them... before this
+    // page disappears"), not just a fixed one-slot minimum. max() with
+    // ROTATION_MS keeps round 73's floor behavior intact for 0/1-event
+    // days where eventsRequiredTime() is shorter than a full slot.
     if (currentScreenId == "events" && targetId != "events") {
-      if (now - currentScreenStart < ROTATION_MS) targetId = "events";
+      unsigned long needed = max((unsigned long)ROTATION_MS, eventsRequiredTime());
+      if (now - currentScreenStart < needed) targetId = "events";
     }
   }
 
