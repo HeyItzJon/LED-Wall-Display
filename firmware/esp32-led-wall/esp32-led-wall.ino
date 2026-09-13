@@ -1049,7 +1049,16 @@ void renderPortfolio(unsigned long now) {
       dma_display->setCursor(187 - 2 - 2 - (int)liveLabel.length() * 6, 1);
       dma_display->print(liveLabel);
     } else {
+      // Static — no pulse/blink, unlike LIVE — same muted gray label,
+      // mirrored to the left of the dot the same way (round 73, Jon:
+      // "I need closed written next to it, similar to the live except
+      // without any of the blinking").
       dma_display->fillCircle(187, 4, 2, dma_display->color565(255, 40, 40));
+      String closedLabel = "CLOSED";
+      dma_display->setTextSize(1);
+      dma_display->setTextColor(dma_display->color565(120, 120, 120));
+      dma_display->setCursor(187 - 2 - 2 - (int)closedLabel.length() * 6, 1);
+      dma_display->print(closedLabel);
     }
   }
 
