@@ -1243,6 +1243,16 @@ int buildHoldingsStrip(StripCmd *cmds, int maxCmds) {
   };
   addText("HOLDINGS", dma_display->color565(0, 200, 255));
   addBar();
+  // Round 73 — Jon: holdings colors stay the same, but on a closed market
+  // he wants "a big, bright, red MARKET CLOSED TODAY disclaimer" spliced
+  // into the strip right after the header, before the up/down holdings.
+  // Reuses the same hasMarketOpen/marketOpen globals renderPortfolio()
+  // already parses off /api/matrix, so no new JSON field is needed, and
+  // it's plain-text same size as the rest of the ticker — just red.
+  if (hasMarketOpen && !marketOpen) {
+    addText("MARKET CLOSED TODAY", dma_display->color565(255, 20, 20));
+    addBar();
+  }
   if (numHoldings == 0) {
     addText("NO HOLDINGS DATA", dma_display->color565(150, 150, 150));
   } else {
@@ -1305,8 +1315,18 @@ unsigned long holdingsRequiredTime() {
     if (end > totalWidth) totalWidth = end;
   }
   const float speedPxPerMs = 0.05f; // must match renderHoldingsTicker's speed
-  int totalW = totalWidth + 40;
-  return (unsigned long)(totalW / speedPxPerMs);
+  // Round 73: renderHoldingsTicker no longer loops the strip back around
+  // (Jon: "I already tried to get it to not be an infinite loop... that
+  // never happened" — so this makes it actually happen). It's a single
+  // pass that starts with HOLDINGS already roughly centered (startShift,
+  // must match renderHoldingsTicker's) instead of pinned at its native
+  // left edge, and needs to run until the last item has fully cleared the
+  // left edge (exitMargin of slack past that, same idea as the old +40).
+  // Required time is the whole distance covered from start to that exit.
+  const float startShift = (W / 2.0f) - 6; // must match renderHoldingsTicker
+  const int exitMargin = 20;
+  float totalScrollDistance = startShift + totalWidth + exitMargin;
+  return (unsigned long)(totalScrollDistance / speedPxPerMs);
 }
 
 void drawStripCmd(const StripCmd &cmd, float sx) {
@@ -1327,16 +1347,20 @@ void renderHoldingsTicker(unsigned long elapsed) {
   dma_display->clearScreen();
   StripCmd cmds[40];
   int n = buildHoldingsStrip(cmds, 40);
-  int totalWidth = 6; // matches the trailing x from buildHoldingsStrip's own bookkeeping
-  for (int i = 0; i < n; i++) {
-    int end = cmds[i].x + (cmds[i].w > 0 && cmds[i].text.length() == 0 ? cmds[i].w : (int)cmds[i].text.length() * 6 * TICKER_TEXT_SIZE);
-    if (end > totalWidth) totalWidth = end;
-  }
   const float speedPxPerMs = 0.05f;
-  int totalW = totalWidth + 40;
-  float offset = fmod(elapsed * speedPxPerMs, (float)totalW);
+  // Round 73: single pass, no wraparound — the old version drew the strip
+  // twice (once at its normal offset, once shifted a full totalW ahead)
+  // so it cycled back to the start forever inside its rotation slot; Jon
+  // wanted a clean finish instead. Starting position is shifted right so
+  // HOLDINGS begins roughly centered rather than pinned at its native
+  // x=6 near the panel's left edge ("just make sure to start the word
+  // holdings somewhere in the middle of the screen we can probably start
+  // the scrolling right away" — no separate static pause needed).
+  // startShift must match holdingsRequiredTime()'s, which is what decides
+  // how long this screen stays up.
+  const float startShift = (W / 2.0f) - 6;
+  float offset = -startShift + elapsed * speedPxPerMs;
   for (int i = 0; i < n; i++) drawStripCmd(cmds[i], cmds[i].x - offset);
-  for (int i = 0; i < n; i++) drawStripCmd(cmds[i], cmds[i].x - offset + totalW);
 }
 
 // Forward declaration: defined later in the file (after renderCommuting),
