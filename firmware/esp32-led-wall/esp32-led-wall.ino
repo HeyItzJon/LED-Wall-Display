@@ -1328,7 +1328,9 @@ int buildHoldingsStrip(StripCmd *cmds, int maxCmds) {
     // so we know these prices... are not current." Kept in the same
     // addText() call (no bar between them) so it reads as one red
     // disclaimer instead of two separately-boxed ticker segments.
-    String closedText = "MARKET CLOSED TODAY";
+    // Round 75 — Jon: strip "MARKET"/"TODAY", just "CLOSED" (matches the
+    // Markets screen's own bare "CLOSED" segment, added this round too).
+    String closedText = "CLOSED";
     if (lastPriceLabel.length() > 0) closedText += "   LAST PRICE: " + lastPriceLabel;
     addText(closedText, dma_display->color565(255, 20, 20));
     addBar();
@@ -1414,7 +1416,18 @@ void drawStripCmd(const StripCmd &cmd, float sx) {
   if (cmd.w > 0 && cmd.text.length() == 0) {
     if (x > -10 && x < W + 10) dma_display->fillRect(x, cmd.y, cmd.w, cmd.h, cmd.color);
   } else {
-    if (x > -200 && x < W + 50) {
+    // Round 75 fix — Jon: "the entire red text line disappears... blank
+    // screen until the first ticker scrolled into view." The old fixed
+    // "-200" cutoff assumed every segment was short (a symbol, a percent
+    // sign) — once the closed-market banner grew a LAST PRICE suffix it
+    // could run 400+px wide, and this cutoff stopped the print() call the
+    // moment the segment's LEFT edge passed -200, well before the text
+    // had actually scrolled clear of the visible 192px panel, so a wide
+    // segment vanished mid-scroll instead of sliding smoothly off. Scale
+    // the left margin to the segment's own width instead of a constant,
+    // so a segment only stops drawing once it's genuinely off-screen.
+    int textWidthPx = (int)cmd.text.length() * 6 * TICKER_TEXT_SIZE;
+    if (x + textWidthPx > -10 && x < W + 50) {
       dma_display->setTextSize(TICKER_TEXT_SIZE);
       dma_display->setTextColor(cmd.color);
       dma_display->setCursor(x, cmd.y);
@@ -1472,6 +1485,14 @@ int buildMarketsStrip(StripCmd *cmds, int maxCmds) {
   };
   addText("MARKETS", dma_display->color565(0, 200, 255));
   addBar();
+  // Round 75 — Jon: same closed-market indicator as Holdings, "in the
+  // same spot, in the same format" — a bare red "CLOSED" right after the
+  // header, before the index data. Reuses the same hasMarketOpen/
+  // marketOpen globals Holdings/Portfolio already parse off /api/matrix.
+  if (hasMarketOpen && !marketOpen) {
+    addText("CLOSED", dma_display->color565(255, 20, 20));
+    addBar();
+  }
   if (numMarkets == 0 && !hasVix) {
     addText("NO MARKET DATA", dma_display->color565(150, 150, 150));
   } else {
