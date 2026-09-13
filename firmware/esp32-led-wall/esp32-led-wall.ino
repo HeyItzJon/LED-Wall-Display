@@ -192,6 +192,12 @@ unsigned long lastDataSuccessTime = 0;
 String enabledScreens[MAX_SCREENS];
 int numEnabledScreens = 0;
 String pinnedScreen = "";
+// Round 75 — the "push" half of "push a page or pin a page depending":
+// a short-lived override that wins over pinnedScreen/rotation without
+// touching either. Backend-authoritative like everything else here — no
+// local countdown, it's just present or not on each ~1-2s poll (see
+// matrixControl.js's pushScreen()/livePushedScreen()).
+String pushedScreenId = "";
 bool notificationActive = false;
 String notificationText = "";
 int notificationSecondsRemaining = 0;
@@ -1042,6 +1048,16 @@ void pollCommand() {
         if (!wasAlertActive) Serial.printf("Alert (%s): %s\n", alertSeverity.c_str(), alertText.c_str());
       } else {
         alertActive = false;
+      }
+
+      // Round 75 — "push a page": present only while the backend's own
+      // expiresAt window is still open (see livePushedScreen()), so this
+      // just tracks whatever the last poll saw with no local timer.
+      String prevPushedScreenId = pushedScreenId;
+      pushedScreenId = (doc.containsKey("pushedScreen") && !doc["pushedScreen"].isNull())
+                         ? doc["pushedScreen"]["id"].as<String>() : "";
+      if (pushedScreenId != prevPushedScreenId && pushedScreenId.length() > 0) {
+        Serial.printf("Pushed screen: %s\n", pushedScreenId.c_str());
       }
 
       if (doc.containsKey("testEvent") && !doc["testEvent"].isNull()) {
@@ -2088,7 +2104,11 @@ void loop() {
   int activeCount = getActiveScreens(activeScreens);
 
   String targetId;
-  if (pinnedScreen.length() > 0) {
+  if (pushedScreenId.length() > 0) {
+    // Round 75 — "push a page": jump here for the backend's short window
+    // without disturbing pinnedScreen or rotation underneath it.
+    targetId = pushedScreenId;
+  } else if (pinnedScreen.length() > 0) {
     targetId = pinnedScreen;
   } else {
     int idx = (now / ROTATION_MS) % activeCount;
