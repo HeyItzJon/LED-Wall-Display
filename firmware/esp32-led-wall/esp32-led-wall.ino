@@ -1899,6 +1899,17 @@ void loop() {
       unsigned long needed = max((unsigned long)ROTATION_MS, holdingsRequiredTime());
       if (now - currentScreenStart < needed) targetId = "holdings";
     }
+    // Events was observed flashing for under a second instead of its
+    // normal 12s slot (round 73 — Jon: "lasts for about one second on
+    // screen"). Nothing in renderEvents() shortens it on purpose — this is
+    // a floor, not an extension like News/Holdings above, guaranteeing it
+    // can never get less than a full ROTATION_MS once shown, whatever
+    // transient condition (an activeScreens-list reshuffle mid-cycle is
+    // the leading suspect) caused the short flash. Applies whether the
+    // screen is showing "NO EVENTS TODAY" or a real event.
+    if (currentScreenId == "events" && targetId != "events") {
+      if (now - currentScreenStart < ROTATION_MS) targetId = "events";
+    }
   }
 
   if (targetId != currentScreenId) {
