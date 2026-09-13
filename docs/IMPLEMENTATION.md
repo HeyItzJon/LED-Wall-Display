@@ -1,3 +1,7 @@
+> **Historical (pre-round-49).** This doc describes the original 3-page scrolling-ticker design, superseded by a full screen-rotation rewrite in rounds 49-62. Kept for history — see [`docs/JSON-CONTRACT.md`](JSON-CONTRACT.md) for the current source of truth, and the main [README](../README.md) for what's still accurate here (wiring/hardware content generally is; page-list/software content generally isn't).
+
+---
+
 # ESP32 LED Wall — Implementation Guide
 
 This guide walks you through building and deploying the LED wall display system.

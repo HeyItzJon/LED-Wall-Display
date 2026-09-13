@@ -1,72 +1,74 @@
 # LED Wall Display for pi-secretary
 
-A complete ESP32-S3 system for displaying portfolio stats, calendar events, and stock holdings on a 192×32 LED wall (3x chained Lyson 32×64 panels).
+An ESP32-S3 system that displays live portfolio, calendar, and system data from the Orange Pi Secretary backend on a 192×32 LED wall (3× chained Lyson 32×64 HUB75 panels).
 
-**Status:** Ready for deployment ✅
+**Status (round 72, 2026-09-13):** deployed and running — confirmed by pulling the actual firmware off the live device. Not the design in this README's older revisions; see [Current design](#current-design-round-72) below.
 
 ---
+
+## Current design (round 72)
+
+This repo went through a full architecture rewrite (rounds 49-62) that this README, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`, and `docs/TESTING.md` never caught up to — they still describe the original 3-page scrolling-ticker design. That older content is kept for history (each file now has a banner at the top), but **`docs/JSON-CONTRACT.md` is the current, actively-maintained source of truth** for the JSON contract, screen list, and render-priority rules. Read that first for anything beyond the quick start below.
+
+The short version: instead of one continuous ticker, the wall now **rotates through named screens** (portfolio, events, holdings, markets, news, weather, clock, day overview, commuting — plus overlay/takeover screens for offline, notifications, alerts, and a wake-up mode), driven by two endpoints polled at different rates:
+
+| Endpoint | Poll interval | Purpose |
+|---|---|---|
+| `GET /api/matrix` | 30s | Real data — portfolio, events, holdings, day overview, news |
+| `GET /api/matrix/command` | 1.5s | Live control — which screens are enabled, a pinned screen, notifications, alerts |
 
 ## Quick Start
 
 ### 1. Backend Setup (Orange Pi)
-Add the `/api/matrix` endpoint to your pi-secretary backend:
+The real `/api/matrix` and `/api/matrix/command` routes live in `pi-secretary/backend/server.js` and `pi-secretary/backend/lib/matrixControl.js` — this repo's `backend/api-matrix-endpoint.js` is a **reference copy** of the `/api/matrix` route only, kept in sync for anyone who needs to diff or restore it. Edit `server.js` directly, then update the reference copy to match, not the other way around.
 
-```bash
-# Copy code from backend/api-matrix-endpoint.js
-# Add it to your backend/server.js (in the "reading" section)
-# Restart your backend
-npm start
-```
-
-Test it:
+Test the real endpoint:
 ```bash
 curl http://192.168.0.130:3001/api/matrix | jq .
+curl http://192.168.0.130:3001/api/matrix/command | jq .
 ```
 
 ### 2. Arduino Setup (Your Computer)
 
 **Install libraries:**
 - Arduino IDE → Sketch → Include Library → Manage Libraries
-- Install: `ESP32-HUB75-MatrixPanel-DMA` (search "HUB75")
+- Install: `ESP32-HUB75-MatrixPanel-I2S-DMA` (search "HUB75")
 - Install: `ArduinoJson`
 
 **Load firmware:**
-- Open `firmware/esp32-led-wall.ino`
-- Edit WiFi settings at the top:
+- Open `firmware/esp32-led-wall/esp32-led-wall.ino`
+- Edit WiFi/Pi settings near the top:
   ```cpp
-  const char* SSID = "YOUR_SSID";
-  const char* PASSWORD = "YOUR_PASSWORD";
-  const char* PI_URL = "http://192.168.0.130:3001/api/matrix";
+  const char* WIFI_SSID     = "Adidas";   // capital A — case-sensitive
+  const char* WIFI_PASSWORD = "...";
+  const char* PI_URL        = "http://192.168.0.130:3001/api/matrix";
+  const char* COMMAND_URL   = "http://192.168.0.130:3001/api/matrix/command";
   ```
 - Upload to ESP32-S3
 
-### 3. Testing Without Panels ⭐
+**Known gaps on the currently-flashed firmware** (confirmed round 72 by diffing the live device's `.ino` against this repo — see `docs/JSON-CONTRACT.md`'s round-72 addendum for the full story):
+- `wakeMode` isn't parsed at all yet — needs porting down before wake-up mode can fire for real, even once the backend sends it.
+- The round-63 boot-panel-init retry fix (`dma_display->begin()` retried with backoff instead of called once, unchecked) isn't on the device yet — the intermittent garbled-boot issue it fixed may still show up.
 
-**Don't have panels yet?** Use simulation mode:
+### 3. Testing Without Panels
 
-- Open `firmware/esp32-led-wall-SIMULATION.ino`
-- Edit WiFi settings (same as above)
+- Open `firmware/esp32-led-wall-SIMULATION/esp32-led-wall-SIMULATION.ino`
+- Edit WiFi/Pi settings (same as above)
 - Upload to ESP32-S3
-- Open Serial Monitor (115200 baud)
-- Watch ASCII art pages display and rotate automatically
-- Validates WiFi, API polling, JSON parsing, and page logic
+- Open Serial Monitor (115200 baud) and watch it poll/parse/log without a physical panel
 
-See `docs/TESTING.md` for detailed testing guide.
+See `docs/TESTING.md` for the original detailed testing guide (still broadly applicable to the polling/parsing mechanics, even though the page list it describes is outdated).
 
-### 4. Panel Wiring (When You Get Them)
+### 4. Panel Wiring
 
-See `docs/IMPLEMENTATION.md` Part 3 for complete wiring guide:
-- HUB75 pinout (all 16 GPIO pins)
-- Power supply setup (5V, 10A+)
-- Chaining 3 panels horizontally
+See `docs/IMPLEMENTATION.md` Part 3 and `PINOUT_V1.html` for the HUB75 pinout, power supply setup, and chaining 3 panels horizontally. Wiring/hardware content in that doc is still accurate — only the software/page-list sections are stale.
 
 ---
 
 ## Documentation
 
-- **[DESIGN.md](docs/DESIGN.md)** — System architecture, page layouts, API spec, fonts & graphics
-- **[IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** — Step-by-step setup, wiring, troubleshooting
-- **[TESTING.md](docs/TESTING.md)** — Complete testing guide without physical panels
+- **[docs/JSON-CONTRACT.md](docs/JSON-CONTRACT.md)** — **current source of truth.** Every field the firmware reads, per-screen behavior, render-priority tiers, and the punch list of what the backend still needs to send.
+- [docs/DESIGN.md](docs/DESIGN.md), [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), [docs/TESTING.md](docs/TESTING.md) — original design docs from the first (pre-round-49) build. Historical; each has a banner pointing back here.
 
 ---
 
@@ -75,167 +77,50 @@ See `docs/IMPLEMENTATION.md` Part 3 for complete wiring guide:
 ```
 .
 ├── firmware/
-│   ├── esp32-led-wall.ino              # Production firmware (for physical panels)
-│   └── esp32-led-wall-SIMULATION.ino   # Testing firmware (no hardware needed)
+│   ├── esp32-led-wall/esp32-led-wall.ino                    # Production firmware
+│   └── esp32-led-wall-SIMULATION/esp32-led-wall-SIMULATION.ino  # Testing firmware (no hardware needed)
 ├── backend/
-│   └── api-matrix-endpoint.js          # Add this to your Orange Pi backend
+│   └── api-matrix-endpoint.js          # Reference copy of /api/matrix — edit server.js first, sync here after
 ├── docs/
-│   ├── DESIGN.md                       # System design & specs
-│   ├── IMPLEMENTATION.md               # Setup & wiring guide
-│   └── TESTING.md                      # Testing without hardware
+│   ├── JSON-CONTRACT.md                # Current source of truth
+│   ├── DESIGN.md                       # Historical — pre-round-49 design
+│   ├── IMPLEMENTATION.md               # Historical — wiring/setup content still accurate
+│   └── TESTING.md                      # Historical — polling/parsing mechanics still broadly accurate
+├── PINOUT_V1.html                       # HUB75 pinout reference
+├── _to_delete/                          # Retired prototype files, kept for reference rather than deleted
 ├── README.md                           # This file
-└── .gitignore                          # Git ignore rules
+└── .gitignore
 ```
-
----
-
-## Features
-
-✅ **3 Display Pages (auto-rotate every 30s):**
-- Market Ticker (scrolling TSX/NASDAQ/S&P + top 3 holdings gainers/losers, mixed, with a portfolio side panel)
-- Today's Events (with busy-level indicators)
-- Top Holdings (cycles through top 5)
-
-✅ **Smart Offline Mode:**
-- Shows "OFFLINE" if backend unreachable
-- Displays last refresh time
-- Continues polling automatically
-
-✅ **Efficient Design:**
-- Small ~1-2KB JSON payloads
-- Polls every 30 seconds
-- Graceful network error handling
-- No stale data shown
-
-✅ **Testing-First:**
-- Simulation mode for pre-panel validation
-- Proves WiFi, JSON parsing, page logic work
-- ASCII art display in Serial Monitor
 
 ---
 
 ## Hardware Required
 
 - **ESP32-S3** (recommend ESP32-S3 DevKit)
-- **3x Lyson 32×64 LED panels** (HUB75 protocol)
+- **3× Lyson 32×64 LED panels** (HUB75 protocol)
 - **5V Power Supply** (10A+ for panels)
-- **WiFi Connection** (same network as Orange Pi)
+- **WiFi Connection** (same network as Orange Pi, 2.4GHz)
 
-Optional:
-- Battery bank (5V, 10Ah) for wireless operation
-- Buck converter (if using higher voltage battery)
-
----
-
-## Next Steps
-
-### Before Panels Arrive
-1. ✅ Add `/api/matrix` endpoint to backend
-2. ✅ Load simulation firmware on ESP32
-3. ✅ Validate WiFi, API, JSON parsing with simulation mode
-4. ✅ Test all 3 pages display correctly in Serial Monitor
-
-### When Panels Arrive
-1. Connect panels to ESP32 via HUB75 (see wiring guide)
-2. Connect power supply to panels
-3. Load production firmware (`esp32-led-wall.ino`)
-4. Enjoy your LED wall! 📺
-
-### Future Enhancements
-- Dashboard control page to switch pages on demand
-- Battery status indicator
-- Custom page order/timing
-- More holdings or filtered events
-- Brightness control
+Optional: battery bank (5V, 10Ah) for wireless operation; buck converter if using a higher-voltage battery.
 
 ---
 
 ## Troubleshooting
 
-### General
-- See **IMPLEMENTATION.md Part 4** for wiring/panel issues
-- See **TESTING.md Phase 4** for simulation mode issues
-
 ### WiFi Not Connecting
-- Verify SSID/password in sketch (case-sensitive)
-- Check ESP32 is in WiFi range
+- Verify SSID/password in the sketch (case-sensitive — `"Adidas"` needs the capital A; this was a real bug, round 56)
 - Ensure WiFi is 2.4GHz (not 5GHz)
 
 ### API Not Responding
-- Test manually: `curl http://192.168.0.130:3001/api/matrix`
-- Verify Orange Pi IP (may have changed)
-- Ensure firewall allows port 3001
+- Test manually: `curl http://192.168.0.130:3001/api/matrix` and `curl http://192.168.0.130:3001/api/matrix/command`
+- Verify the Orange Pi's IP hasn't changed
+- Ensure the firewall allows port 3001
 
-### JSON Errors
-- Manually test endpoint and validate JSON response
-- Verify ArduinoJson library is installed
-
----
-
-## API Response Format
-
-**Endpoint:** `GET /api/matrix`
-
-Makes zero external API calls — every field is read from the meta blobs the
-15-minute pull cycle already wrote (`moneySummary`, `marketPulse`). See the
-comment at the top of `backend/api-matrix-endpoint.js` for exactly which
-cached field feeds which JSON field.
-
-**Response (sample):**
-```json
-{
-  "timestamp": 1693478400000,
-  "lastRefresh": 1693478350000,
-  "portfolio": {
-    "total": 125450.50,
-    "dayChange": 1250.75,
-    "dayChangePercent": 1.01
-  },
-  "markets": [
-    { "symbol": "TSX", "changePercent": 0.42 },
-    { "symbol": "NASDAQ", "changePercent": -0.18 },
-    { "symbol": "S&P", "changePercent": 0.31 }
-  ],
-  "gainers": [
-    { "symbol": "AAPL", "changePercent": 2.3 }
-  ],
-  "losers": [
-    { "symbol": "META", "changePercent": -1.4 }
-  ],
-  "events": [
-    {
-      "time": "10:00",
-      "title": "Team standup",
-      "busyLevel": "busy"
-    }
-  ],
-  "dailyBusyPercent": 68,
-  "holdings": [
-    {
-      "symbol": "AAPL",
-      "value": 45000,
-      "dayChangePercent": 2.3,
-      "weightPercent": 35.8
-    }
-  ]
-}
-```
+### JSON / screen issues
+See `docs/JSON-CONTRACT.md` — it documents exactly what happens (fallback text, default values) when any given field is absent, which is usually the actual symptom rather than a real error.
 
 ---
 
 ## License
 
-Built for pi-secretary project. Integrate with your Orange Pi backend.
-
----
-
-## Files Summary
-
-| File | Purpose |
-|------|---------|
-| `esp32-led-wall.ino` | Production firmware (requires HUB75 library & physical panels) |
-| `esp32-led-wall-SIMULATION.ino` | Test firmware (no hardware, just ArduinoJson library) |
-| `api-matrix-endpoint.js` | Backend endpoint code (add to Orange Pi server.js) |
-| `DESIGN.md` | System architecture, page layouts, API spec |
-| `IMPLEMENTATION.md` | Step-by-step setup, wiring, troubleshooting |
-| `TESTING.md` | Complete testing guide without panels |
+Built for the pi-secretary project. Integrate with your Orange Pi backend.
