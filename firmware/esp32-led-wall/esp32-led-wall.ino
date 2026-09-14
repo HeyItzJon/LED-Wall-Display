@@ -246,6 +246,11 @@ struct BootTiming {
   unsigned long t1, t2, t3, t4, t5, t6;
 };
 struct EventPlan { String cap, desc; int capOverflow, descOverflow; unsigned long dur; };
+// Round 76 — declared here (not next to computeAllDayPlan() below, where
+// it's actually used) for the same reason EventPlan above is: Arduino's
+// auto-generated function prototypes are inserted near the TOP of the
+// sketch, before any type declared further down would be visible yet.
+struct AllDayPlan { String cap; int capOverflow; unsigned long dur; };
 struct StripCmd { bool isIcon; int x, y, w, h; String text; uint32_t iconCp; uint16_t color; };
 struct NotifCmd { bool isIcon; int x, w; String text; uint32_t cp; };
 struct AlertLevel { uint8_t ar, ag, ab, br, bg, bb, tr, tg, tb; };
@@ -989,8 +994,8 @@ void pollData() {
         }
       }
 
-      Serial.printf("Data OK — total $%.2f, %d events, %d all-day, %d holdings, %d news, %d markets\n",
-                    portfolioTotal, numEvents, numAllDay, numHoldings, numNews, numMarkets);
+      Serial.printf("Data OK — total $%.2f, %d events, %d all-day, %d holdings, %d news, %d markets, busy=%d\n",
+                    portfolioTotal, numEvents, numAllDay, numHoldings, numNews, numMarkets, dailyBusyPercent);
     } else {
       Serial.printf("JSON parse error on /api/matrix: %s\n", err.c_str());
     }
@@ -1218,7 +1223,7 @@ String eventCaption(const EventItem &e) {
 // Event caption/description scrolling — sit still for a beat, then crawl
 // left slowly enough to read, then hold briefly before moving on. Every
 // event gets at least EVENT_MIN_HOLD even if it never needs to scroll.
-const unsigned long EVENT_STATIC_HOLD = 2000, EVENT_END_HOLD = 600, EVENT_MIN_HOLD = 4000;
+const unsigned long EVENT_STATIC_HOLD = 2000, EVENT_END_HOLD = 3000, EVENT_MIN_HOLD = 7000;
 const float EVENT_SCROLL_SPEED = 0.018f;
 
 unsigned long textRequiredTime(int overflowPx) {
@@ -1249,8 +1254,8 @@ void computeEventPlan(int capMaxW, EventPlan *plan) {
 // Round 76 — same idea as computeEventPlan(), but for the new dedicated
 // all-day page: one caption per all-day event ("ALL DAY: <title>"), no
 // desc line, no timeline bar (there's no start/end time to plot).
-struct AllDayPlan { String cap; int capOverflow; unsigned long dur; };
-
+// (AllDayPlan itself is declared up near EventPlan — see the comment
+// there for why.)
 void computeAllDayPlan(int capMaxW, AllDayPlan *plan) {
   for (int i = 0; i < numAllDay; i++) {
     String s = "ALL DAY: " + allDayEvents[i].title;
@@ -2049,6 +2054,7 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "stars") renderStars(screenElapsed);
   else if (id == "balls") renderBalls(screenElapsed);
   else if (id == "alerts") renderAlert(now);
+  else if (id == "offline") renderOffline(now); // preview only — see loop()'s own offline check for the real thing
   else renderComingSoonFwd(id, now); // weather, and anything unrecognized
 }
 
