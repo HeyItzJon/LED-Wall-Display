@@ -1182,13 +1182,21 @@ uint16_t calColor(const String &cal) {
   if (cal == "assessment")  return dma_display->color565(191, 147, 0);  // css #9c7a0a
   if (cal == "important")   return dma_display->color565(110, 30, 199); // css #7440ad
   if (cal == "work")        return dma_display->color565(223, 15, 0);   // css #c22a1f
-  if (cal == "family")      return dma_display->color565(38, 45, 221);  // css #4a4fc0
+  // Round 76 — Jon: colors "still wrong... a lot of events are showing up
+  // as yellow even though they should be a different color." Family is
+  // teal/sea-green in his real calendar (it was wrongly sharing Sydney's
+  // Demands' blue before this round); Sydney's Demands and Regular Events
+  // never had their own bucket at all, so both silently fell through to
+  // "personal" below — which is exactly the stray yellow he was seeing.
+  if (cal == "family")      return dma_display->color565(20, 200, 145); // css #1f8f6f, brighter for LED
+  if (cal == "sydney")      return dma_display->color565(60, 70, 255);  // css #4a4fc0, brighter for LED
+  if (cal == "regular")     return dma_display->color565(190, 196, 204); // css #8b8f95, near-white for LED
   if (cal == "deadline")    return dma_display->color565(193, 44, 0);   // css #a83c1c
   if (cal == "class")       return dma_display->color565(0, 191, 63);   // css #1f7a3d
   if (cal == "admin")       return dma_display->color565(85, 137, 191); // css #40566d
   if (cal == "appointment") return dma_display->color565(10, 152, 191); // css #276f83
   if (cal == "gmail")       return dma_display->color565(0, 113, 193);  // css #1f6fa8
-  return dma_display->color565(191, 185, 7); // css #767322 — "personal", also the fallback category
+  return dma_display->color565(120, 125, 135); // css #5a5f66 — "personal" fallback, no longer yellow (round 76)
 }
 
 // Fallback for events that don't have a "cal" field yet — reuses the
