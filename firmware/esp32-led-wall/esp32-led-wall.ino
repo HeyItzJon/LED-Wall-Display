@@ -142,6 +142,17 @@ struct EventItem {
 EventItem events[MAX_EVENTS];
 int numEvents = 0;
 
+// Round 76 — Jon: "a new separate page with the all day events
+// separately... they can scroll." All-day events used to be mixed into
+// events[] with an empty time string, which sorted them first and gave
+// them a bogus hour-0 timeline sliver — that's the "beginning of the
+// timeline" bug. The backend now excludes them from `events` entirely
+// and sends this separate, time-free list instead (see server.js).
+#define MAX_ALLDAY 6
+struct AllDayEventItem { String title; String cal; };
+AllDayEventItem allDayEvents[MAX_ALLDAY];
+int numAllDay = 0;
+
 struct HoldingItem { String symbol; float value; float dayChangePercent; float weightPercent; };
 HoldingItem holdings[MAX_HOLDINGS];
 int numHoldings = 0;
@@ -917,6 +928,17 @@ void pollData() {
         }
       }
 
+      // Round 76 — see AllDayEventItem comment above.
+      numAllDay = 0;
+      if (doc.containsKey("allDayEvents")) {
+        for (JsonVariant v : doc["allDayEvents"].as<JsonArray>()) {
+          if (numAllDay >= MAX_ALLDAY) break;
+          allDayEvents[numAllDay].title = v["title"] | "";
+          allDayEvents[numAllDay].cal   = v["cal"] | "";
+          numAllDay++;
+        }
+      }
+
       numHoldings = 0;
       if (doc.containsKey("holdings")) {
         for (JsonVariant v : doc["holdings"].as<JsonArray>()) {
@@ -967,8 +989,8 @@ void pollData() {
         }
       }
 
-      Serial.printf("Data OK — total $%.2f, %d events, %d holdings, %d news, %d markets\n",
-                    portfolioTotal, numEvents, numHoldings, numNews, numMarkets);
+      Serial.printf("Data OK — total $%.2f, %d events, %d all-day, %d holdings, %d news, %d markets\n",
+                    portfolioTotal, numEvents, numAllDay, numHoldings, numNews, numMarkets);
     } else {
       Serial.printf("JSON parse error on /api/matrix: %s\n", err.c_str());
     }
@@ -1216,6 +1238,30 @@ void computeEventPlan(int capMaxW, EventPlan *plan) {
   }
 }
 
+// Round 76 — same idea as computeEventPlan(), but for the new dedicated
+// all-day page: one caption per all-day event ("ALL DAY: <title>"), no
+// desc line, no timeline bar (there's no start/end time to plot).
+struct AllDayPlan { String cap; int capOverflow; unsigned long dur; };
+
+void computeAllDayPlan(int capMaxW, AllDayPlan *plan) {
+  for (int i = 0; i < numAllDay; i++) {
+    String s = "ALL DAY: " + allDayEvents[i].title;
+    s.toUpperCase();
+    plan[i].cap = s;
+    plan[i].capOverflow = max(0, (int)plan[i].cap.length() * 6 - capMaxW);
+    plan[i].dur = max((unsigned long)EVENT_MIN_HOLD, textRequiredTime(plan[i].capOverflow));
+  }
+}
+
+unsigned long allDayRequiredTime(int capMaxW) {
+  if (numAllDay == 0) return 0;
+  AllDayPlan plan[MAX_ALLDAY];
+  computeAllDayPlan(capMaxW, plan);
+  unsigned long total = 0;
+  for (int i = 0; i < numAllDay; i++) total += plan[i].dur;
+  return total;
+}
+
 // How long the Events screen needs to stay up to cycle through every event
 // at least once. renderEvents() below picks the current event from
 // `elapsed % cycle` over ALL numEvents events, but until round 74 nothing
@@ -1227,13 +1273,14 @@ void computeEventPlan(int capMaxW, EventPlan *plan) {
 // Recomputes the same plan computeEventPlan() builds so this can never
 // drift out of sync with what renderEvents() actually cycles through.
 unsigned long eventsRequiredTime() {
-  if (numEvents == 0) return 0;
+  if (numEvents == 0 && numAllDay == 0) return 0;
   const int barX0 = 2; // must match renderEvents()'s margin
   int capMaxW = W - barX0 - 2;
   EventPlan plan[MAX_EVENTS];
   computeEventPlan(capMaxW, plan);
   unsigned long cycle = 0;
   for (int i = 0; i < numEvents; i++) cycle += plan[i].dur;
+  cycle += allDayRequiredTime(capMaxW); // round 76 — all-day page's own slot
   return cycle;
 }
 
@@ -1244,7 +1291,7 @@ void renderEvents(unsigned long elapsed) {
   // budget as the title above it (nothing left to dodge any more).
   const int barX0 = 2, barX1 = W - 2;
 
-  if (numEvents == 0) {
+  if (numEvents == 0 && numAllDay == 0) {
     dma_display->setTextSize(1);
     dma_display->setTextColor(dma_display->color565(150, 150, 150));
     dma_display->setCursor(barX0, 13);
@@ -1255,11 +1302,35 @@ void renderEvents(unsigned long elapsed) {
   int capMaxW = W - barX0 - 2;
   EventPlan plan[MAX_EVENTS];
   computeEventPlan(capMaxW, plan);
+  AllDayPlan allDayPlan[MAX_ALLDAY];
+  computeAllDayPlan(capMaxW, allDayPlan);
 
   unsigned long cycle = 0;
   for (int i = 0; i < numEvents; i++) cycle += plan[i].dur;
+  unsigned long allDayStart = cycle; // all-day page's slot starts where the timed events end
+  for (int i = 0; i < numAllDay; i++) cycle += allDayPlan[i].dur;
   if (cycle == 0) cycle = 1;
   unsigned long tMod = elapsed % cycle;
+
+  if (tMod >= allDayStart) {
+    // Round 76 — dedicated all-day page: cycles through each all-day
+    // event's title on its own (same scroll style as a timed event's
+    // caption), with no timeline bar underneath — there's no start/end
+    // time to plot for an all-day event, and Jon explicitly did not want
+    // them mixed into the timed-events timeline any more.
+    unsigned long t = tMod - allDayStart;
+    int ai = 0;
+    while (ai < numAllDay - 1 && t >= allDayPlan[ai].dur) { t -= allDayPlan[ai].dur; ai++; }
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(calColorFallback(allDayEvents[ai].cal, ""));
+    dma_display->setCursor(barX0 - scrollOffsetPx(t, allDayPlan[ai].capOverflow), 1);
+    dma_display->print(allDayPlan[ai].cap);
+    dma_display->setTextColor(dma_display->color565(120, 118, 110));
+    dma_display->setCursor(barX0, 13);
+    dma_display->print(numAllDay <= 1 ? "ALL-DAY EVENT" : ("ALL-DAY EVENT " + String(ai + 1) + "/" + String(numAllDay)));
+    return;
+  }
+
   int idx = 0;
   while (idx < numEvents - 1 && tMod >= plan[idx].dur) { tMod -= plan[idx].dur; idx++; }
 
