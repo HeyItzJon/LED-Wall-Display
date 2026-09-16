@@ -413,13 +413,31 @@ void printBold(int x, int y, const String &s, uint16_t color) {
   dma_display->print(s);
 }
 
-const unsigned long WAKEUP_T_BLACK = 1200;     // pure black, just the corner label
-const unsigned long WAKEUP_T_BLUE = 4000;      // navy blues fully faded in, no orange yet
-const unsigned long WAKEUP_T_SUNPOKE = 6500;   // sun's top edge starts breaking the horizon
-const unsigned long WAKEUP_T_ORANGE = 10000;   // sun fully risen to resting height, orange filled in
-const unsigned long WAKEUP_T_YELLOW = 13000;   // whole screen warmed toward yellow, sun at final size
-const unsigned long WAKEUP_T_TEXTFADE = 1500;  // "GOOD MORNING" fade-in duration
-const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~14.5s — settled state begins here
+// Round 91 follow-up — Jon: "way way slower... instead of being a 10s
+// endeavour it becomes more of a minute long endeavour, slow slow slow."
+// One uniform ~4.6x scale factor across all five stage markers (ported
+// from the Twin, not re-derived here) so the original pacing shape — how
+// far into each window the next stage kicks in — carries through
+// unchanged, just stretched. YELLOW landing on a clean 60000 is
+// deliberate: "more of a minute long endeavour."
+const unsigned long WAKEUP_T_BLACK = 5500;     // pure black/starfield beat — "no colors on screen" yet
+const unsigned long WAKEUP_T_BLUE = 18500;     // navy blues fully faded in, no orange yet
+const unsigned long WAKEUP_T_SUNPOKE = 30000;  // sun's top edge starts breaking the horizon
+const unsigned long WAKEUP_T_ORANGE = 46000;   // sun fully risen to resting height, orange filled in
+const unsigned long WAKEUP_T_YELLOW = 60000;   // whole screen warmed toward yellow, sun at final size
+const unsigned long WAKEUP_T_TEXTFADE = 6000;  // "GOOD MORNING" fade-in duration — slow, matches the rest
+const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~66s — settled state begins here
+
+// Same follow-up — the "WAKE UP MODE" corner label used to just be tied
+// to the same textP timer as GOOD MORNING, meaning it sat on screen the
+// entire ~13s intro. Jon: "appear faint and only for the first like 5
+// seconds so we know what's coming, after that it fades out slowly and
+// lets the animation do its thing." Kept on its own independent clock
+// rather than the staged timeline above, since "first 5 seconds" needs to
+// mean the same thing no matter how long the rest of the sequence runs.
+const unsigned long WAKEUP_LABEL_HOLD = 5000;  // shown plainly (but faint, not full white) this long
+const unsigned long WAKEUP_LABEL_FADE = 4000;  // then fades out over this long, staying off for the rest of the buildup
+const float WAKEUP_LABEL_ALPHA = 0.55f;        // faint — never full brightness even at its most visible
 
 // Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
 // bottom-right landing spot and the top-left corner label. (WakeupStar
@@ -2097,12 +2115,14 @@ float sleepWindowFrac(int mins) {
 void renderSleepAlarm(unsigned long now) {
   dma_display->clearScreen();
 
+  // Round 91 follow-up — Jon: "the sleep mode placeholder to be like the
+  // rest, like commuting and like the former news and markets ones." No
+  // real backend data source for sleep/alarm yet (same boat markets/news
+  // used to be in), so this uses the same generic rainbow-label "COMING
+  // SOON" card everything else without real data falls back to, instead
+  // of a bespoke placeholder.
   if (!sleepAlarm.hasData) {
-    dma_display->setTextSize(1);
-    dma_display->setTextColor(dma_display->color565(90, 85, 75));
-    String tbd = "SLEEP DATA COMING SOON";
-    dma_display->setCursor(centerTextX(tbd, 6), 14);
-    dma_display->print(tbd);
+    renderComingSoonFwd("sleep", now);
     return;
   }
 
@@ -2202,13 +2222,20 @@ void renderWakeUp(unsigned long t) {
   float bob = sin(holdT / 1800.0f) * 1.2f;
 
   // Sky — vertical gradient, staged black -> navy -> orange horizon glow
-  // -> warm yellow, exactly like the Twin.
+  // -> warm yellow, exactly like the Twin. Round 91 follow-up — Jon: "the
+  // sun to be more prominant... making the rest less white." The yellow-
+  // phase targets were [120,108,74]/[255,196,80] — bright enough that the
+  // sky right around the sun's landing spot got close to the sun's own
+  // halo/core brightness, so it read as one soft blob instead of a sun
+  // sitting IN a sky. Dimmed and pushed more toward saturated orange
+  // (less toward white) so the sky stays visibly darker than the sun at
+  // every point in the fade.
   RGBf BLACKC = rgbf(0, 0, 0);
   RGBf top = lerp3f(BLACKC, rgbf(10, 16, 42), blueP);
   RGBf bot = lerp3f(BLACKC, rgbf(16, 26, 64), blueP);
   bot = lerp3f(bot, rgbf(214, 112, 36), orangeSpreadP);
-  top = lerp3f(top, rgbf(120, 108, 74), yellowP);
-  bot = lerp3f(bot, rgbf(255, 196, 80), yellowP);
+  top = lerp3f(top, rgbf(65, 55, 40), yellowP);
+  bot = lerp3f(bot, rgbf(195, 120, 35), yellowP);
   float glowMod = 1.0f + glowWobble;
   top = rgbf(clamp255f(top.r * glowMod), clamp255f(top.g * glowMod), clamp255f(top.b * glowMod));
   bot = rgbf(clamp255f(bot.r * glowMod), clamp255f(bot.g * glowMod), clamp255f(bot.b * glowMod));
@@ -2247,9 +2274,14 @@ void renderWakeUp(unsigned long t) {
     int rHalo = (int)round(14 * sizeScale), rMid = (int)round(9 * sizeScale);
     int rCore = max(1, (int)round(5 * sizeScale)), rBright = max(1, (int)round(3 * sizeScale));
     RGBf haloColor = hsvToRGBf(38, 200, 255);
+    // Round 91 follow-up, same "more prominent sun" ask — halo/mid
+    // blended a bit stronger (0.10/0.22 -> 0.14/0.30) so there's a visible
+    // ring even against the now-dimmer sky, and core/bright pushed
+    // further apart below (more saturated core, whiter hot center)
+    // instead of both sitting at similar washed-out brightness.
     for (int pass = 0; pass < 2; pass++) {
       int r = pass == 0 ? rHalo : rMid;
-      float alpha = pass == 0 ? 0.10f : 0.22f;
+      float alpha = pass == 0 ? 0.14f : 0.30f;
       if (r <= 0) continue;
       float rr = (r + 0.5f) * (r + 0.5f);
       for (int dy = -r; dy <= r; dy++) {
@@ -2266,17 +2298,24 @@ void renderWakeUp(unsigned long t) {
         }
       }
     }
-    dma_display->fillCircle(sunX, (int)round(sunY), rCore, packRGBf(hsvToRGBf(42, 150, 255)));
-    dma_display->fillCircle(sunX, (int)round(sunY), rBright, packRGBf(hsvToRGBf(48, 70, 255)));
+    dma_display->fillCircle(sunX, (int)round(sunY), rCore, packRGBf(hsvToRGBf(45, 190, 255)));
+    dma_display->fillCircle(sunX, (int)round(sunY), rBright, packRGBf(hsvToRGBf(48, 40, 255)));
   }
 
-  // Corner label during the intro, "GOOD MORNING" full-screen once the
-  // sequence lands — one crossfades into the other. Both are color-mixed
-  // against the current sky rather than flat-blended, so the fade reads
-  // correctly over the gradient.
+  // Corner label at the very start, "GOOD MORNING" full-screen once the
+  // sequence lands — these no longer crossfade into each other (round 91
+  // follow-up: the label used to be tied to the same textP timer as GOOD
+  // MORNING, which meant it sat on screen for the entire intro; at ~60s
+  // total that would mean nearly the whole buildup. Now it's a brief,
+  // faint "here's what's coming" on its own independent clock
+  // (WAKEUP_LABEL_HOLD/FADE), gone well before the sunrise gets going, so
+  // the rest of the runtime is just the animation with nothing overlaid
+  // on it). Both are still color-mixed against the current sky rather
+  // than flat-blended, so the fade reads correctly over the gradient.
   dma_display->setTextSize(1);
-  if (textP < 0.3f) {
-    RGBf labelColor = lerp3f(top, rgbf(255, 255, 255), 1.0f - (textP / 0.3f));
+  float labelP = 1.0f - wakeupSmoothstep(WAKEUP_LABEL_HOLD, WAKEUP_LABEL_HOLD + WAKEUP_LABEL_FADE, t);
+  if (labelP > 0.02f) {
+    RGBf labelColor = lerp3f(top, rgbf(255, 255, 255), labelP * WAKEUP_LABEL_ALPHA);
     dma_display->setTextColor(packRGBf(labelColor));
     dma_display->setCursor(4, 2);
     dma_display->print("WAKE UP MODE");
