@@ -1785,7 +1785,7 @@ void renderClock() {
   String dateStr = String(WEEKDAY_ABBR[timeinfo.tm_wday]) + " " + String(MONTH_ABBR[timeinfo.tm_mon]) + " " + String(timeinfo.tm_mday);
   dma_display->setTextSize(1);
   dma_display->setTextColor(dma_display->color565(150, 150, 150));
-  dma_display->setCursor(centerTextX(dateStr, 6), 24);
+  dma_display->setCursor(centerTextX(dateStr, 6), 23); // round 89: nudged up 1px per Jon
   dma_display->print(dateStr);
 }
 
@@ -2244,6 +2244,36 @@ unsigned long weatherRequiredTime() {
   return weatherTotalCycleMs(summaryUpper);
 }
 
+// ---- temperature-to-color gradient (round 89) ----
+// Jon: "-30 is the most frigid, darkest blue you can think of... zero is
+// white... progressively more yellowish, then orange, then darker red at
+// +30." Two gradients meeting at white, each a straight RGB interpolation
+// between control points (matches this file's "rules decide" convention —
+// no HSV math, just a lookup a person could sanity-check by eye): cold
+// half blends a deep navy up to white as tempC rises from -30 to 0; warm
+// half runs white -> pale yellow -> orange -> a deeper (not neon) red
+// across three sub-segments from 0 to +30. Clamped at both ends so
+// anything colder/hotter than +/-30 still reads as the most extreme color
+// instead of extrapolating past it.
+uint16_t lerpColor565(uint8_t r0, uint8_t g0, uint8_t b0, uint8_t r1, uint8_t g1, uint8_t b1, float t) {
+  if (t < 0) t = 0; if (t > 1) t = 1;
+  uint8_t r = r0 + (int)round((r1 - r0) * t);
+  uint8_t g = g0 + (int)round((g1 - g0) * t);
+  uint8_t b = b0 + (int)round((b1 - b0) * t);
+  return dma_display->color565(r, g, b);
+}
+
+uint16_t tempToColor565(int tempC) {
+  if (tempC <= 0) {
+    float f = (tempC + 30.0f) / 30.0f; // -30 -> 0.0, 0 -> 1.0
+    return lerpColor565(20, 40, 160, 255, 255, 255, f); // deep navy -> white
+  }
+  float f = tempC / 30.0f; // 0 -> 0.0, +30 -> 1.0
+  if (f <= 0.5f) return lerpColor565(255, 255, 255, 255, 210, 90, f / 0.5f);        // white -> pale yellow
+  if (f <= 0.8f) return lerpColor565(255, 210, 90, 255, 120, 20, (f - 0.5f) / 0.3f); // pale yellow -> orange
+  return lerpColor565(255, 120, 20, 170, 20, 20, (f - 0.8f) / 0.2f);                 // orange -> darker red
+}
+
 void renderWeather(unsigned long elapsed) {
   dma_display->clearScreen();
 
@@ -2285,7 +2315,7 @@ void renderWeather(unsigned long elapsed) {
   int tempX = iconX + iconW + iconGapPx;
   int tempY = (int)round(topCenterY - tempH / 2.0f);
   dma_display->setTextSize(tempSize);
-  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setTextColor(tempToColor565(weatherTempC)); // round 89: temp-gradient color
   dma_display->setCursor(tempX, tempY);
   dma_display->print(tempText);
   // Degree mark: pulses at the portfolio LIVE dot's own rate (elapsed/260),
@@ -2298,15 +2328,29 @@ void renderWeather(unsigned long elapsed) {
   drawWeatherDegreeMark(tempX + (int)tempText.length() * 6 * tempSize, tempY + 2,
                         scaleColor565(255, 255, 255, degreePulse));
 
-  // hi-lo, stacked H over L, also centered on that same axis
+  // hi-lo, stacked H over L, also centered on that same axis. Round 89 —
+  // Jon: "H:" and "L:" stay white always; only the number after them takes
+  // the temp-gradient color (e.g. a high of 18 prints "H:" white then "18"
+  // in that gradient's orange) — so each line is now two print() calls
+  // instead of one, with the label's fixed 2-char width ("H:"/"L:" at text
+  // size 1) used to place the number right after it.
   int hiloX = tempX + tempBlockW + hiloGapPx;
   int hiloY0 = (int)round(topCenterY - hiloStackH / 2.0f);
+  const int hiloLabelW = 2 * 6; // "H:" / "L:" at text size 1
+  String hiNumStr = String(weatherHighC), loNumStr = String(weatherLowC);
   dma_display->setTextSize(1);
-  dma_display->setTextColor(dma_display->color565(150, 150, 150));
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
   dma_display->setCursor(hiloX, hiloY0);
-  dma_display->print(hiText);
+  dma_display->print("H:");
+  dma_display->setTextColor(tempToColor565(weatherHighC));
+  dma_display->setCursor(hiloX + hiloLabelW, hiloY0);
+  dma_display->print(hiNumStr);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
   dma_display->setCursor(hiloX, hiloY0 + 7 + hiloGapRows);
-  dma_display->print(loText);
+  dma_display->print("L:");
+  dma_display->setTextColor(tempToColor565(weatherLowC));
+  dma_display->setCursor(hiloX + hiloLabelW, hiloY0 + 7 + hiloGapRows);
+  dma_display->print(loNumStr);
 
   // ---- bottom band: summary ticker alternating with the hourly timeline bar ----
   String summary = weatherSummary; summary.toUpperCase();
