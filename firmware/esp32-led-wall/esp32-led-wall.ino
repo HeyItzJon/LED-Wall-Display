@@ -131,6 +131,44 @@ unsigned long lastFrameTime = 0;
 unsigned long lastDataFetchAttempt = 0;
 unsigned long lastCommandFetchAttempt = 0;
 
+// Round 91 follow-up — Jon: "it feels slow now, any reasons are we hitting
+// limits?" There was no actual data to answer that with — nothing here
+// measured render time or free heap — so this is a lightweight Serial
+// diagnostic rather than a guess. loop() is already software-capped at
+// FRAME_INTERVAL_MS (30ms, ~33fps); logFrameDiagnostics() times how long
+// each frame's actual render+draw work takes (from right after that cap
+// check to right before the DMA flip) and rolls it into a 10-second
+// avg/max, alongside ESP.getFreeHeap(). If avg/max render time is well
+// under 30ms and free heap stays flat over time, the render loop itself
+// isn't the bottleneck — the "slow" feeling is coming from somewhere else
+// (network polling stalls, WiFi retries, etc). If render time is close to
+// or over 30ms, or free heap trends downward the longer it runs (heap
+// fragmentation from the heavy String usage throughout this sketch is the
+// likely suspect there), that's the real limit to chase. Cheap enough
+// (a few micros()/arithmetic ops a frame, one Serial.printf per 10s) that
+// it shouldn't itself be the slowdown it's measuring.
+const unsigned long DIAG_INTERVAL_MS = 10000;
+unsigned long lastDiagPrint = 0;
+unsigned long diagFrameCount = 0;
+unsigned long diagFrameTimeSumUs = 0;
+unsigned long diagFrameTimeMaxUs = 0;
+
+void logFrameDiagnostics(unsigned long frameStartUs, unsigned long now) {
+  unsigned long elapsedUs = micros() - frameStartUs;
+  diagFrameCount++;
+  diagFrameTimeSumUs += elapsedUs;
+  if (elapsedUs > diagFrameTimeMaxUs) diagFrameTimeMaxUs = elapsedUs;
+  if (now - lastDiagPrint >= DIAG_INTERVAL_MS) {
+    lastDiagPrint = now;
+    float avgMs = diagFrameCount > 0 ? (diagFrameTimeSumUs / 1000.0f) / diagFrameCount : 0.0f;
+    Serial.printf("[diag] frame render avg=%.2fms max=%.2fms over %lu frames (cap %lums) | free heap=%u bytes\n",
+                  avgMs, diagFrameTimeMaxUs / 1000.0f, diagFrameCount, FRAME_INTERVAL_MS, (unsigned)ESP.getFreeHeap());
+    diagFrameCount = 0;
+    diagFrameTimeSumUs = 0;
+    diagFrameTimeMaxUs = 0;
+  }
+}
+
 // Set this to a screen id ("stars", "balls", "alerts", "dayoverview", ...)
 // to pin the wall to it permanently for bench testing, ignoring WiFi state,
 // data staleness, and the normal rotation entirely. Leave empty for normal
@@ -246,6 +284,26 @@ String weatherSummary = "";
 String weatherHourly[MAX_WEATHER_HOURLY];
 int numWeatherHourly = 0;
 
+// Commute Stats — round 92, per Jon: "lets cook up a quick commute stats
+// page for the led wall. with the top stats minus the money spend and the
+// top brief scrolling like the weather thing." Real data since
+// lib/commute.js's full-day plan: server.js's slim commuteStats block
+// (deliberately NOT the full commutePlan — see that file's own comment)
+// carries just the day's drive-minutes/km totals, the three already-
+// decided day-level facts (rushLegCount/bothRushHit/heavyDriveDay —
+// lib/commute.js decides these, this firmware only ever displays them),
+// and the DeepSeek insight line. hasData false (no "commuteStats" key at
+// all yet — not configured, or nothing located to route to today) falls
+// back to renderComingSoonFwd via renderScreen()'s dispatch, same
+// convention as hasWeather/numNews above.
+bool hasCommuteStats = false;
+int commuteStatsDriveMin = 0;
+float commuteStatsKm = 0;
+int commuteStatsRushLegCount = 0;
+bool commuteStatsBothRushHit = false;
+bool commuteStatsHeavyDriveDay = false;
+String commuteStatsInsight = "";
+
 bool dataValid = false;
 unsigned long lastDataSuccessTime = 0;
 
@@ -262,7 +320,8 @@ unsigned long lastWifiConnectedTime = 0;
 // dayoverview, commuting, stars, balls, sleep, wakeup), and clock/
 // dayoverview/commuting no longer get hardcoded in on top of whatever the
 // backend sends (see getActiveScreens() below) — 16 leaves headroom for
-// the catalog to keep growing without this needing to change again.
+// the catalog to keep growing without this needing to change again. (Round
+// 92 added a 14th, commutestats — still comfortably under 16.)
 #define MAX_SCREENS 16
 String enabledScreens[MAX_SCREENS];
 int numEnabledScreens = 0;
@@ -1244,6 +1303,22 @@ void pollData() {
             weatherHourly[numWeatherHourly++] = h.as<String>();
           }
         }
+      }
+
+      // Commute Stats — round 92. See the struct comment above for what
+      // each field is; server.js only ever sends this block for TODAY
+      // (null otherwise), so hasCommuteStats false correctly means
+      // "nothing to show" whether that's because nothing's configured or
+      // it's simply a new day with a stale cache.
+      hasCommuteStats = doc.containsKey("commuteStats") && !doc["commuteStats"].isNull();
+      if (hasCommuteStats) {
+        JsonVariant cv = doc["commuteStats"];
+        commuteStatsDriveMin      = cv["totalDriveMinutes"] | 0;
+        commuteStatsKm            = cv["totalKm"] | 0.0;
+        commuteStatsRushLegCount  = cv["rushLegCount"] | 0;
+        commuteStatsBothRushHit   = cv["bothRushHit"] | false;
+        commuteStatsHeavyDriveDay = cv["heavyDriveDay"] | false;
+        commuteStatsInsight       = cv["insight"] | "";
       }
 
       Serial.printf("Data OK — total $%.2f, %d events, %d all-day, %d holdings, %d news, %d markets, busy=%d\n",
@@ -2434,6 +2509,122 @@ void renderCommuting(unsigned long elapsed) {
 }
 
 // ============================================================
+// Commute Stats — round 92, per Jon: "lets cook up a quick commute stats
+// page for the led wall. with the top stats minus the money spend and the
+// top brief scrolling like the weather thing." Top band: today's two
+// drive totals (minutes, km) — the same pair the dashboard's own Commute
+// page totals strip shows, minus the gas figure, per Jon's own wording.
+// Bottom band: the DeepSeek insight line (lib/commuteTake.js), scrolling
+// the same hold/scroll/hold way the Weather screen's summary ticker
+// does — just without that screen's second, alternating hourly-timeline
+// view, since there's no equivalent here to alternate with.
+// ============================================================
+
+const float CSTATS_SCROLL_SPEED_PX_MS = 0.02f;
+const unsigned long CSTATS_HOLD_MS = 3000;
+
+// Shared between renderCommuteStats() and commuteStatsRequiredTime() below
+// so the rotation timer and the actual on-screen scroll can never drift
+// apart — same discipline newsRequiredTime()/weatherRequiredTime() use.
+unsigned long commuteStatsTickerCycleMs(const String &textUpper, int availW) {
+  int textW = (int)textUpper.length() * 6;
+  if (textW <= availW) return CSTATS_HOLD_MS; // sits still, nothing to scroll
+  int scrollPx = textW - availW;
+  return CSTATS_HOLD_MS * 2 + (unsigned long)(scrollPx / CSTATS_SCROLL_SPEED_PX_MS);
+}
+
+// How long this screen needs to show the insight line at least once before
+// rotating away — 0 (no extension) when there's no insight to scroll at
+// all, same "nothing to protect" convention weatherRequiredTime() follows
+// when hasWeather is false.
+unsigned long commuteStatsRequiredTime() {
+  if (!hasCommuteStats || commuteStatsInsight.length() == 0) return 0;
+  String textUpper = commuteStatsInsight; textUpper.toUpperCase();
+  const int availW = (W - 4) - 4; // matches renderCommuteStats()'s TICKER_X0/X1 below
+  return commuteStatsTickerCycleMs(textUpper, availW);
+}
+
+void renderCommuteStats(unsigned long elapsed) {
+  dma_display->clearScreen();
+
+  const int TOP_Y0 = 0, TOP_Y1 = 19;
+  const int TICKER_X0 = 4, TICKER_X1 = W - 4, TICKER_Y = 23;
+
+  // ---- top band: MIN DRIVE / KM DRIVEN, centered as one group (same
+  // "two stats side by side" shape as Weather's temp/hi-lo pairing) ----
+  String minText = String(commuteStatsDriveMin);
+  String kmText = String(commuteStatsKm, 1);
+  const int bigSize = 2, bigH = 7 * bigSize;
+  const int labelGap = 2;
+  const char *minLabel = "MIN DRIVE";
+  const char *kmLabel = "KM DRIVEN";
+  int minW = (int)minText.length() * 6 * bigSize;
+  int kmW = (int)kmText.length() * 6 * bigSize;
+  int minLabelW = (int)strlen(minLabel) * 6;
+  int kmLabelW = (int)strlen(kmLabel) * 6;
+  int blockAW = max(minW, minLabelW);
+  int blockBW = max(kmW, kmLabelW);
+  const int blockGap = 16;
+  int groupW = blockAW + blockGap + blockBW;
+  int groupX0 = TICKER_X0 + max(0, ((TICKER_X1 - TICKER_X0) - groupW) / 2);
+  int stackH = bigH + labelGap + 7;
+  int topCenterY = (TOP_Y0 + TOP_Y1) / 2;
+  int numY = topCenterY - stackH / 2;
+  int labelY = numY + bigH + labelGap;
+
+  dma_display->setTextSize(bigSize);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setCursor(groupX0 + max(0, (blockAW - minW) / 2), numY);
+  dma_display->print(minText);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(150, 150, 150));
+  dma_display->setCursor(groupX0 + max(0, (blockAW - minLabelW) / 2), labelY);
+  dma_display->print(minLabel);
+
+  int blockBX0 = groupX0 + blockAW + blockGap;
+  dma_display->setTextSize(bigSize);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setCursor(blockBX0 + max(0, (blockBW - kmW) / 2), numY);
+  dma_display->print(kmText);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(150, 150, 150));
+  dma_display->setCursor(blockBX0 + max(0, (blockBW - kmLabelW) / 2), labelY);
+  dma_display->print(kmLabel);
+
+  // ---- bottom band: the DeepSeek insight line, scrolling ----
+  if (commuteStatsInsight.length() == 0) {
+    String sub = "NO INSIGHT YET";
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(dma_display->color565(120, 120, 120));
+    dma_display->setCursor(centerTextX(sub, 6), TICKER_Y);
+    dma_display->print(sub);
+    return;
+  }
+
+  String text = commuteStatsInsight; text.toUpperCase();
+  int availW = TICKER_X1 - TICKER_X0;
+  int textW = (int)text.length() * 6;
+  bool needsScroll = textW > availW;
+  unsigned long cycle = commuteStatsTickerCycleMs(text, availW);
+  unsigned long t = elapsed % cycle;
+
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(200, 200, 200));
+  if (!needsScroll) {
+    dma_display->setCursor(centerTextX(text, 6), TICKER_Y);
+    dma_display->print(text);
+  } else {
+    int scrollPx = textW - availW;
+    float x;
+    if (t < CSTATS_HOLD_MS) x = TICKER_X0;
+    else if (t < CSTATS_HOLD_MS + scrollPx / CSTATS_SCROLL_SPEED_PX_MS) x = TICKER_X0 - (t - CSTATS_HOLD_MS) * CSTATS_SCROLL_SPEED_PX_MS;
+    else x = TICKER_X0 - scrollPx;
+    dma_display->setCursor((int)round(x), TICKER_Y);
+    dma_display->print(text);
+  }
+}
+
+// ============================================================
 // Weather — round 86. Real backend data (sources/weather.js's icon
 // buckets/current temp/hi-lo/summary/hourly timeline), ported
 // pixel-for-pixel from the HUB75 Twin browser simulator
@@ -3144,6 +3335,10 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "alerts") renderAlert(now);
   else if (id == "offline") renderOffline(now); // preview only — see loop()'s own offline check for the real thing
   else if (id == "weather") { if (hasWeather) renderWeather(screenElapsed); else renderComingSoonFwd(id, now); }
+  // Round 92 — Commute Stats. Same hasX-gated pattern as Weather: no
+  // "commuteStats" block at all yet (not configured, or nothing located
+  // to route to today) falls back to the plain "COMING SOON" card.
+  else if (id == "commutestats") { if (hasCommuteStats) renderCommuteStats(screenElapsed); else renderComingSoonFwd(id, now); }
   // Round 91 — Sleep & Alarm renderer is self-gating (renderSleepAlarm()
   // shows its own "coming soon" card when sleepAlarm.hasData is false), so
   // no hasWeather-style check needed here.
@@ -3274,9 +3469,11 @@ void loop() {
 
   if (now - lastFrameTime < FRAME_INTERVAL_MS) return;
   lastFrameTime = now;
+  unsigned long frameStartUs = micros(); // round 91 diagnostic — see logFrameDiagnostics() above
 
   if (strlen(FORCE_SCREEN) > 0) {
     renderScreen(String(FORCE_SCREEN), now - forceScreenStart, now);
+    logFrameDiagnostics(frameStartUs, now);
     dma_display->flipDMABuffer();
     return;
   }
@@ -3284,18 +3481,21 @@ void loop() {
   bool offline = !dataValid || (now - lastDataSuccessTime > STALE_THRESHOLD_MS);
   if (offline) {
     renderOffline(now);
+    logFrameDiagnostics(frameStartUs, now);
     dma_display->flipDMABuffer();
     return;
   }
 
   if (alertActive) {
     renderAlert(now);
+    logFrameDiagnostics(frameStartUs, now);
     dma_display->flipDMABuffer();
     return;
   }
 
   if (notificationActive) {
     renderNotification(now);
+    logFrameDiagnostics(frameStartUs, now);
     dma_display->flipDMABuffer();
     return;
   }
@@ -3355,6 +3555,13 @@ void loop() {
       unsigned long needed = max((unsigned long)ROTATION_MS, weatherRequiredTime());
       if (now - currentScreenStart < needed) targetId = "weather";
     }
+    // Commute Stats — round 92, same extension as Weather above: the
+    // insight line can need a full scroll pass longer than one fixed
+    // rotation slot.
+    if (currentScreenId == "commutestats" && targetId != "commutestats") {
+      unsigned long needed = max((unsigned long)ROTATION_MS, commuteStatsRequiredTime());
+      if (now - currentScreenStart < needed) targetId = "commutestats";
+    }
   }
 
   if (targetId != currentScreenId) {
@@ -3364,6 +3571,7 @@ void loop() {
   }
 
   renderScreen(currentScreenId, now - currentScreenStart, now);
+  logFrameDiagnostics(frameStartUs, now);
   // Double-buffered above (mxconfig.double_buff, see setup()) — this flip
   // is what makes every frame atomic. Without it the DMA engine can scan
   // out a frame while the CPU is mid-draw (e.g. text already drawn but the
