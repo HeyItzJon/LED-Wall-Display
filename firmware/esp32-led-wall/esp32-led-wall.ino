@@ -2123,17 +2123,28 @@ void drawWeatherDegreeMark(int x, int y, uint16_t color) {
   dma_display->drawPixel(x, y, dma_display->color565(0, 0, 0));
 }
 
-// ---- hourly timeline bar (rounds 84-85.1) ----
-const int TIMELINE_BAR_H = 6;
+// ---- hourly timeline bar (rounds 84-85.1, 88) ----
+// Round 88 — Jon: the grey/cloud columns were "way too bright... hard to
+// see the other colours," and he wanted the timeline (not the cloud icon
+// elsewhere on this screen — that sprite is untouched) raised and made 1px
+// taller. TIMELINE_BAR_H going 6->7 does both at once: barY0 below is
+// `H - 2 - TIMELINE_BAR_H`, so growing this by 1 raises the bar's top row
+// by 1 while its bottom row stays exactly where it always was.
+const int TIMELINE_BAR_H = 7;
 
 // One flat color per row (top row first), by icon bucket — ported from
 // the Twin's TIMELINE_PATTERNS. row is 0..TIMELINE_BAR_H-1.
 uint16_t weatherTimelineRowColor(const String &icon, int row) {
-  const uint16_t YELLOW = dma_display->color565(255, 201, 60);
-  const uint16_t GREY   = dma_display->color565(159, 176, 196);
-  const uint16_t BLUE   = dma_display->color565(66, 173, 244);
+  // Round 88 — Jon: grey nearly unreadable against the other colors, wanted
+  // it "almost the dimmest white we can make," and the yellow/blue/red
+  // pushed to maximum brightness/saturation so they pop against that much
+  // darker grey. GREY keeps its original cool-blue hue ratio, just scaled
+  // way down (was 159,176,196 — same proportions, ~18% of the brightness).
+  const uint16_t YELLOW = dma_display->color565(255, 220, 0);
+  const uint16_t GREY   = dma_display->color565(28, 31, 35);
+  const uint16_t BLUE   = dma_display->color565(20, 140, 255);
   const uint16_t WHITE  = dma_display->color565(255, 255, 255);
-  const uint16_t RED    = dma_display->color565(255, 30, 20);
+  const uint16_t RED    = dma_display->color565(255, 0, 0);
   if (icon == "sun") return YELLOW;
   if (icon == "partly_sunny") return row < 3 ? YELLOW : GREY; // half yellow, half grey — round 85.1
   if (icon == "rain") return row < 2 ? GREY : BLUE;
@@ -2182,13 +2193,18 @@ void drawWeatherTimeline(int x0, int x1, int y0, float alpha, unsigned long elap
     int nowMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
     int cursorX = x0 + (int)round(minutesToFrac(nowMinutes) * (x1 - x0));
     float nowPulseAlpha = 0.55f + 0.45f * ((sin(elapsed / 260.0) + 1) / 2.0f);
-    // Near-white, slight blue tinge (round 85.1 — Jon: "make the cursor
-    // white, that way theres more contrast, maybe slight yellow or blue
-    // tinge so it shows with snow" — the original gold cursor read too
-    // close to the bar's own yellow/orange tones and barely showed
-    // against solid-white snow columns).
-    uint16_t cursorColor = scaleColor565(222, 236, 255, nowPulseAlpha * alpha);
-    int earTop = y0 - 2, earBottom = y0 + TIMELINE_BAR_H; // 2px above the bar, 1px below it
+    // Near-white, slight YELLOW tinge (round 88 — Jon switched this from the
+    // round 85.1 blue tinge to yellow; still clearly brighter than the new,
+    // much darker TIMELINE_GREY and still distinct from solid-white snow
+    // columns so it doesn't blend into either).
+    uint16_t cursorColor = scaleColor565(255, 248, 200, nowPulseAlpha * alpha);
+    // Round 88 — Jon wanted the bottom overhang to match the top overhang
+    // (was 2px above / 1px below; both 2px now) and the cursor tall enough
+    // to still clear the raised, now-taller bar by the same 1px it always
+    // has. earTop unchanged at 2px above the bar's (new, higher) top row;
+    // earBottom now 2px below the bar's bottom row (y0+TIMELINE_BAR_H-1),
+    // same distance as earTop's 2px gap above the bar's top row.
+    int earTop = y0 - 2, earBottom = y0 + TIMELINE_BAR_H + 1;
     dma_display->fillRect(cursorX - 1, earTop, 3, 1, cursorColor);
     dma_display->fillRect(cursorX, earTop + 1, 1, earBottom - earTop - 1, cursorColor);
     dma_display->fillRect(cursorX - 1, earBottom, 3, 1, cursorColor);
@@ -2232,7 +2248,11 @@ void renderWeather(unsigned long elapsed) {
   dma_display->clearScreen();
 
   const int WX_TOP_Y0 = 0, WX_TOP_Y1 = 22;                             // top band: icon + temp/hi-lo
-  const int WX_TICKER_X0 = 2, WX_TICKER_X1 = W - 2, WX_TICKER_Y = 24;  // ticker: full width, bottom band
+  // WX_TICKER_Y nudged up 1px (round 87 — Jon: the ticker text's bottom row
+  // was landing exactly on the panel's last row, flush against the physical
+  // edge; this leaves 1px of margin below it, same reasoning as the other
+  // "give it room to breathe" nudges already in this file).
+  const int WX_TICKER_X0 = 2, WX_TICKER_X1 = W - 2, WX_TICKER_Y = 23;  // ticker: full width, bottom band
 
   String icon = weatherIcon;
   int iconH = weatherIconHeight(icon);
@@ -2268,11 +2288,13 @@ void renderWeather(unsigned long elapsed) {
   dma_display->setTextColor(dma_display->color565(255, 255, 255));
   dma_display->setCursor(tempX, tempY);
   dma_display->print(tempText);
-  // Degree mark: pulses full-on/full-off — same "complete 0-1 sweep" style
-  // as the portfolio LIVE dot, and at that dot's own rate (elapsed/260),
-  // not a slower one (round 85 — Jon: the original slower breathe read as
-  // too sluggish).
-  float degreePulse = (sin(elapsed / 260.0) + 1) / 2.0f;
+  // Degree mark: pulses at the portfolio LIVE dot's own rate (elapsed/260),
+  // but — round 87 — never truly off. It used to be a complete 0-1 sweep
+  // (same style as the LIVE dot), which read as "fading out completely";
+  // Jon wanted it to keep breathing without going fully dark, so this uses
+  // the same 0.55-floor sweep as the timeline's own now-cursor pulse
+  // instead of a 0-to-1 one.
+  float degreePulse = 0.55f + 0.45f * ((sin(elapsed / 260.0) + 1) / 2.0f);
   drawWeatherDegreeMark(tempX + (int)tempText.length() * 6 * tempSize, tempY + 2,
                         scaleColor565(255, 255, 255, degreePulse));
 
