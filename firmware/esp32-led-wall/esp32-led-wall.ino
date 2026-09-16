@@ -2038,9 +2038,15 @@ void renderDayOverview() {
   // circle one pixel to the right and make it as bright white as
   // possible. can we make it bold?" Nudged +1px, printed via printBold()
   // (same faux-bold trick as Wake Up Mode's GOOD MORNING text) instead of
-  // a single plain print, full 255,255,255 white (already the max).
+  // a single plain print.
+  // Round 91 follow-up #2 — Jon: "in black (so no pixels)... make sure it
+  // is still painted on the circle so that we have a number." Was
+  // white-on-color; now explicitly painted black so the digit reads as a
+  // punched-out cutout in the lit circle rather than a bright overlay on
+  // it — still drawn (not left as background), just black instead of
+  // white pixels.
   int scoreX = dotX - (int)round(scoreStr.length() * 6 / 2.0) + 1;
-  printBold(scoreX, dotY - 3, scoreStr, dma_display->color565(255, 255, 255));
+  printBold(scoreX, dotY - 3, scoreStr, dma_display->color565(0, 0, 0));
 
   String busyText = "BUSY SCORE";
   dma_display->setTextColor(scoreColor);
@@ -2321,23 +2327,27 @@ void renderWakeUp(unsigned long t) {
     dma_display->print("WAKE UP MODE");
   }
   if (textP > 0.02f) {
-    // "GOOD" / "MORNING" at size 2 are each exactly 16px tall, stacking to
-    // fill the full 32px panel height with no gap. Faux-bold via
+    // Round 91 follow-up — Jon: "since we have more room lengthwise than
+    // heightwise and its cramped... put good morning horizontal (centered
+    // vertically)." Used to be two stacked lines ("GOOD"/"MORNING") sized
+    // to exactly fill the panel's 32px height with no gap — worked at
+    // that size but read cramped, especially with a 4th screen mode
+    // coming soon that'll want some of this vertical room back. "GOOD
+    // MORNING" as one line at size 2 is 12 chars * 12px = 144px wide
+    // against a 192px-wide panel, well within bounds, so it fits as a
+    // single centered row with room to spare on both axes. Faux-bold via
     // printBold(). Once settled, a slow white->gold shimmer keeps it from
     // looking static now that the background behind it is flat black.
     RGBf GOLD = rgbf(255, 200, 110);
     float holdPulse = holdT > 0 ? ((sin(holdT / 1400.0f) + 1) / 2.0f) * 0.18f : 0.0f;
-    const char *lines[2] = { "GOOD", "MORNING" };
-    const int ys[2] = { 0, 16 };
+    String msg = "GOOD MORNING";
+    const int msgY = (H - 16) / 2; // size-2 glyphs are 16px tall — centers in the 32px panel
     dma_display->setTextSize(2);
-    for (int i = 0; i < 2; i++) {
-      String msg = lines[i];
-      float rowF = (float)ys[i] / (float)(H - 1);
-      RGBf msgBg = lerp3f(top, bot, rowF);
-      RGBf color = lerp3f(msgBg, rgbf(255, 255, 255), textP);
-      color = lerp3f(color, GOLD, holdPulse);
-      printBold(centerTextX(msg, 12), ys[i], msg, packRGBf(color));
-    }
+    float rowF = (float)msgY / (float)(H - 1);
+    RGBf msgBg = lerp3f(top, bot, rowF);
+    RGBf color = lerp3f(msgBg, rgbf(255, 255, 255), textP);
+    color = lerp3f(color, GOLD, holdPulse);
+    printBold(centerTextX(msg, 12), msgY, msg, packRGBf(color));
   }
 }
 
