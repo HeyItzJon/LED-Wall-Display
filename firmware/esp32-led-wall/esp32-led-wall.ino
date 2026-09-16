@@ -13,15 +13,21 @@
 // to that same card automatically whenever the backend hasn't sent anything
 // usable yet (no headlines, or no weather block at all) — no firmware
 // change needed if that ever happens again, they just pick back up the
-// moment real data resumes. clock,
-// dayoverview and commuting are firmware-local screens the backend's
-// screen catalog doesn't know about yet, so they always ride along in the
-// rotation regardless of what the web Wall tab has enabled/disabled — see
-// getActiveScreens(). Auto-rotation includes every one of the above (per
-// Jon's explicit ask: "every menu is included, including the ones coming
-// soon"). "stars"/"balls" are ambient demo effects, not data screens —
-// they're fully implemented but intentionally left out of normal rotation;
-// see FORCE_SCREEN below to bench-test them.
+// moment real data resumes.
+//
+// Round 91 — clock, dayoverview, commuting, stars, and balls are now real
+// entries in the backend's screen catalog (matrixControl.js) with genuine
+// rotation checkboxes on the web Wall tab, same as any other screen.
+// getActiveScreens() no longer force-injects any of them — enabledScreens
+// (from /api/matrix/command) is the one source of truth for what's in
+// rotation, falling back to a small DEFAULTS list only if the Pi has never
+// answered even once. Sleep & Alarm (id "sleep") and Wake Up Mode (id
+// "wakeup") are also in the catalog now as pin/push-only preview screens
+// (hasData: false — no real backend source yet); Sleep & Alarm has a real
+// renderer here (renderSleepAlarm(), ported from the HUB75 Twin), Wake Up
+// Mode's animated sunrise takeover is still Twin-only pending a firmware
+// port (it leans on true alpha-blended compositing the direct-to-hardware
+// HUB75 driver doesn't support yet).
 //
 // WiFi credentials and Pi address are filled in below. NOTE: the SSID is
 // "Adidas" with a capital A — WiFi.begin() does a case-sensitive exact
@@ -185,10 +191,11 @@ bool hasMarketOpen = false, marketOpen = false;
 // ticker's MARKET CLOSED TODAY banner, see buildHoldingsStrip() below.
 String lastPriceLabel = "";
 
-// Day Overview extra fields — NOT sent by the backend yet (only
-// dailyBusyPercent and the event count are real today). Never fabricated:
-// hasHours/hasCommute gate whether renderDayOverview()/renderCommuting()
-// draw these numbers at all. See handoff doc.
+// Day Overview extra fields. hoursBusy/hoursFree ARE real backend data as
+// of round 72 (server.js computes them off today's actual calendar) —
+// commuteMin still has no real ETA source wired up. hasHours/hasCommute
+// still gate whether renderDayOverview()/renderCommuting() draw these
+// numbers at all, never fabricated either way. See handoff doc.
 struct DayOverviewData {
   bool hasHours = false;
   float hoursBusy = 0, hoursFree = 0;
@@ -196,6 +203,28 @@ struct DayOverviewData {
   int commuteMin = 0;
 };
 DayOverviewData dayOverview;
+
+// Round 91 — Sleep & Alarm, ported from the HUB75 Twin's prototype
+// (renderSleepAlarm() below). hasData is false in the backend catalog
+// (no real sleep-schedule/alarm source exists yet), so this always shows
+// the "coming soon" fallback for now — struct + parsing are here and
+// forward-compatible so the real screen lights up the moment a `sleep`
+// block ever shows up in /api/matrix, with zero further firmware change.
+#define MAX_SLEEP_EVENTS 4
+struct SleepEvent {
+  String label;
+  String time;   // "HH:MM", 24h
+  String period; // "late" or "early"
+};
+struct SleepAlarmData {
+  bool hasData = false;
+  String bedTime = "23:00";
+  String wakeTime = "07:00";
+  String nextAlarm = "07:00";
+  SleepEvent nearbyEvents[MAX_SLEEP_EVENTS];
+  int numNearbyEvents = 0;
+};
+SleepAlarmData sleepAlarm;
 
 // Weather — round 86. sources/weather.js's current temp/hi-lo/icon/summary
 // and the hourly icon timeline, replacing the previous COMING SOON
@@ -223,7 +252,13 @@ unsigned long lastDataSuccessTime = 0;
 unsigned long lastWifiConnectedTime = 0;
 
 // ---- Data model: /api/matrix/command ----
-#define MAX_SCREENS 12
+// Round 91 — bumped from 12: the backend's unified screen catalog is now
+// 13 entries (portfolio, markets, holdings, events, news, weather, clock,
+// dayoverview, commuting, stars, balls, sleep, wakeup), and clock/
+// dayoverview/commuting no longer get hardcoded in on top of whatever the
+// backend sends (see getActiveScreens() below) — 16 leaves headroom for
+// the catalog to keep growing without this needing to change again.
+#define MAX_SCREENS 16
 String enabledScreens[MAX_SCREENS];
 int numEnabledScreens = 0;
 String pinnedScreen = "";
@@ -315,6 +350,15 @@ int centerTextX(const String &s, int charWidthPx) {
   int w = s.length() * charWidthPx;
   int x = (W - w) / 2;
   return x < 0 ? 0 : x;
+}
+
+// Round 91 — same idea as centerTextX but within an arbitrary x0..x1
+// sub-range instead of the full panel width. Needed for renderSleepAlarm()'s
+// left/right split, ported from the Twin's centerXIn().
+int centerTextXIn(const String &s, int charWidthPx, int x0, int x1) {
+  int w = s.length() * charWidthPx;
+  int x = x0 + max(0, (int)round(((x1 - x0) - w) / 2.0));
+  return x;
 }
 
 String formatMoney(float v) {
@@ -822,7 +866,17 @@ void runBootSplash() {
 // Status screens (WiFi connecting / initial data fetch) — simplified to
 // match the simulator: title, subtitle, spinner, no border/scan bar.
 // ============================================================
-void drawStatusScreen(String title, String subtitle, unsigned long t, uint16_t accentColor) {
+// Round 91 — Jon: "I like the Wifi connected page with the network name
+// but can we remove the animated spinner once it connected, it looks
+// weird and frozen." The spinner only ever reads as alive while its
+// caller keeps looping and redrawing with an advancing `t` (true for
+// "CONNECTING TO WIFI" and "Fetching data..." above); a screen that's
+// drawn once and then held for a few seconds behind a single delay()
+// froze it mid-frame, which is exactly what "WIFI CONNECTED" was doing.
+// showSpinner defaults true so every existing loop-driven call site is
+// unaffected; the two one-shot "we're done, here's the result" screens
+// below pass false.
+void drawStatusScreen(String title, String subtitle, unsigned long t, uint16_t accentColor, bool showSpinner = true) {
   dma_display->clearScreen();
 
   dma_display->setTextSize(1);
@@ -834,11 +888,13 @@ void drawStatusScreen(String title, String subtitle, unsigned long t, uint16_t a
   dma_display->setCursor(centerTextX(subtitle, 6), 14);
   dma_display->print(subtitle);
 
-  const char spin[4] = {'|', '/', '-', '\\'};
-  char sc = spin[(t / 150) % 4];
-  dma_display->setTextColor(accentColor);
-  dma_display->setCursor(W / 2 - 3, 23);
-  dma_display->print(sc);
+  if (showSpinner) {
+    const char spin[4] = {'|', '/', '-', '\\'};
+    char sc = spin[(t / 150) % 4];
+    dma_display->setTextColor(accentColor);
+    dma_display->setCursor(W / 2 - 3, 23);
+    dma_display->print(sc);
+  }
 
   // This (and renderBootFrame) are the only screens ever drawn outside the
   // main loop() — during setup(), before loop()'s own flipDMABuffer() at
@@ -869,8 +925,10 @@ bool connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    drawStatusScreen("WIFI CONNECTED", WIFI_SSID, millis(), dma_display->color565(0, 255, 120));
-    delay(900);
+    // Round 91 — no spinner (see drawStatusScreen's comment) and held for
+    // a full 3s (was 900ms) so there's actually time to read it.
+    drawStatusScreen("WIFI CONNECTED", WIFI_SSID, millis(), dma_display->color565(0, 255, 120), false);
+    delay(3000);
     return true;
   }
 
@@ -1011,7 +1069,9 @@ void pollData() {
         }
       }
 
-      // Day Overview extras — not sent by the backend yet at all.
+      // Day Overview extras — hoursBusy/hoursFree ARE real since round 72
+      // (server.js's weekForecast() on today's actual calendar); commuteMin
+      // still has no real ETA source, hence hasCommute staying gated.
       dayOverview.hasHours = false;
       dayOverview.hasCommute = false;
       if (doc.containsKey("dayOverview") && !doc["dayOverview"].isNull()) {
@@ -1024,6 +1084,30 @@ void pollData() {
         if (dov.containsKey("commuteMin")) {
           dayOverview.hasCommute = true;
           dayOverview.commuteMin = dov["commuteMin"] | 0;
+        }
+      }
+
+      // Round 91 — Sleep & Alarm. Forward-compatible parsing for a `sleep`
+      // block that doesn't exist in the backend payload yet (no real
+      // source — see matrixControl.js's hasData:false on this screen);
+      // this just means it lights up automatically with zero firmware
+      // change the day a real source lands, same convention as
+      // News/Weather degrading gracefully when their key is absent.
+      sleepAlarm.hasData = doc.containsKey("sleep") && !doc["sleep"].isNull();
+      if (sleepAlarm.hasData) {
+        JsonVariant sv = doc["sleep"];
+        sleepAlarm.bedTime = sv["bedTime"] | "23:00";
+        sleepAlarm.wakeTime = sv["wakeTime"] | "07:00";
+        sleepAlarm.nextAlarm = sv["nextAlarm"] | sleepAlarm.wakeTime;
+        sleepAlarm.numNearbyEvents = 0;
+        if (sv.containsKey("nearbyEvents")) {
+          for (JsonVariant ev : sv["nearbyEvents"].as<JsonArray>()) {
+            if (sleepAlarm.numNearbyEvents >= MAX_SLEEP_EVENTS) break;
+            SleepEvent &se = sleepAlarm.nearbyEvents[sleepAlarm.numNearbyEvents++];
+            se.label = ev["label"] | "";
+            se.time = ev["time"] | "00:00";
+            se.period = ev["period"] | "early";
+          }
         }
       }
 
@@ -1066,23 +1150,26 @@ int getActiveScreens(String *out) {
   if (numEnabledScreens > 0) {
     for (int i = 0; i < numEnabledScreens && n < MAX_SCREENS; i++) out[n++] = enabledScreens[i];
   } else {
-    // Default rotation if /api/matrix/command has never answered yet.
-    // Includes every screen this firmware knows how to render, per Jon's
-    // explicit ask — "every menu is included, including the ones coming
-    // soon" — not just the ones with real data.
-    const char *DEFAULTS[] = { "portfolio", "events", "holdings", "markets", "news", "weather" };
-    for (int i = 0; i < 6 && n < MAX_SCREENS; i++) out[n++] = String(DEFAULTS[i]);
-  }
-  // clock/dayoverview/commuting are firmware-local screens the backend's
-  // screen catalog has no id for yet, so they aren't toggleable from the
-  // web Wall tab — they always ride along in the rotation regardless of
-  // what enabledScreens says. See handoff doc if/when the backend adds ids
-  // for these and this should become a real toggle instead.
-  const char *LOCAL_ONLY[] = { "clock", "dayoverview", "commuting" };
-  for (int i = 0; i < 3; i++) {
-    bool already = false;
-    for (int j = 0; j < n; j++) if (out[j] == LOCAL_ONLY[i]) { already = true; break; }
-    if (!already && n < MAX_SCREENS) out[n++] = String(LOCAL_ONLY[i]);
+    // Round 91 — Jon: "auto rotate should be able to rotate through every
+    // single page available, selectable in the checkbox menu." That means
+    // enabledScreens (from the backend's matrixControl.js) is now the only
+    // source of truth for rotation membership — clock/dayoverview/
+    // commuting used to be force-injected below regardless of what the web
+    // Wall tab had checked, which is exactly why "Today's Timeline" (the
+    // busy-score page) could show up in rotation with no checkbox to find
+    // or turn it off. That forced-injection block is gone.
+    //
+    // This DEFAULTS fallback only fires if /api/matrix/command has never
+    // answered even once (e.g. the Pi is unreachable from first boot) — a
+    // judgment call, flagged to Jon rather than silently made: it includes
+    // clock/dayoverview/commuting (real, useful screens with no dependency
+    // on the Pi actually answering) but deliberately leaves out stars/
+    // balls, since showing an ambient demo effect as the *fallback* during
+    // a can't-reach-the-Pi outage seemed like the wrong first impression.
+    // Once a real poll succeeds, enabledScreens takes over completely.
+    const char *DEFAULTS[] = { "portfolio", "events", "holdings", "markets", "news", "weather",
+                                "clock", "dayoverview", "commuting" };
+    for (int i = 0; i < 9 && n < MAX_SCREENS; i++) out[n++] = String(DEFAULTS[i]);
   }
   return n;
 }
@@ -1170,6 +1257,22 @@ void runInitialDataFetch() {
     if (!dataValid) delay(400);
   }
   pollCommand();
+
+  // Round 91 — Jon: "same with the pi fetch page, I want to see the
+  // status," same treatment as WIFI CONNECTED above: a real one-shot
+  // result screen (green when the fetch actually landed, red if it timed
+  // out) instead of cutting straight into rotation the instant this
+  // function returns. No spinner (see drawStatusScreen's comment) and
+  // held 3s so it's actually readable. Subtitle deliberately doesn't show
+  // PI_HOST — round 79 already settled that the boot screens show plain
+  // status text, never a network address (that round's "SSID not IP" fix
+  // on WIFI CONNECTED), so this stays consistent with that.
+  if (dataValid) {
+    drawStatusScreen("PI CONNECTED", "Data received", millis(), dma_display->color565(0, 255, 120), false);
+  } else {
+    drawStatusScreen("NO DATA YET", "Will keep retrying", millis(), dma_display->color565(255, 70, 60), false);
+  }
+  delay(3000);
 }
 
 // ============================================================
@@ -1789,18 +1892,41 @@ void renderClock() {
   dma_display->print(dateStr);
 }
 
-// Day Overview: busy score + event count (both real, existing /api/matrix
-// fields) always show. The hours-busy/hours-free row only draws if the
-// backend has actually sent dayOverview.hoursBusy/hoursFree — never
-// fabricated. See handoff doc for the backend field this needs.
+// Day Overview — round 91 redesign, Jon: "I want some sort of half page
+// split, where one half is a bar with the busy side and the free side
+// where the colour seperation shifts based on the proportion of each, the
+// label of Xh busy and Xh free should be below this display chart line on
+// the respective side, the rest of the page should have the x events and
+// busy score parts." Top half (y 0-15): the existing score-dot/"BUSY N"/
+// event-count row, unchanged. Bottom half (y 16-31): the new proportional
+// busy/free bar — the color boundary between the two sides sits exactly at
+// hoursBusy/(hoursBusy+hoursFree) along the bar's width, not a fixed
+// midpoint — with "X.XH BUSY"/"X.XH FREE" labels below it on their
+// respective sides. Still real, still gated: the bar and its labels only
+// draw when the backend has actually sent hoursBusy/hoursFree (rules
+// decide the split, this just renders it) — same "coming soon" fallback
+// as before when it hasn't.
 void renderDayOverview() {
   dma_display->clearScreen();
+
+  // Top half — busy score + event count (both real, existing fields).
+  // Round 91 — Jon: "a slightly bigger coloured circle with a centered
+  // number inside of it in white as we were doing way way back. right
+  // now the circle would be barely big enough but one extra pixel all
+  // around would make it perfect." dotR 4->5; the score number now lives
+  // inside the circle in white, so the label beside it drops the digit
+  // and just reads "BUSY SCORE".
   int score = max(0, min(10, (int)round(dailyBusyPercent / 10.0)));
   uint16_t scoreColor = busyScoreColor(score);
-  const int dotR = 4, dotX = 2 + dotR, dotY = 5;
+  const int dotR = 5, dotX = 2 + dotR, dotY = 5;
   dma_display->fillCircle(dotX, dotY, dotR, scoreColor);
-  String busyText = "BUSY " + String(score);
   dma_display->setTextSize(1);
+  String scoreStr = String(score);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setCursor(dotX - (int)round(scoreStr.length() * 6 / 2.0), dotY - 3);
+  dma_display->print(scoreStr);
+
+  String busyText = "BUSY SCORE";
   dma_display->setTextColor(scoreColor);
   dma_display->setCursor(dotX + dotR + 3, 2);
   dma_display->print(busyText);
@@ -1810,26 +1936,345 @@ void renderDayOverview() {
   dma_display->setCursor(W - 2 - (int)evText.length() * 6, 2);
   dma_display->print(evText);
 
+  // Bottom half — proportional busy/free bar + labels below it.
+  // Round 91 — Jon: "id like the free portion of the busy free to be
+  // grey, that way a less busy day that is also green ... doesnt match
+  // the green free part." A light-busy day's scoreColor IS green
+  // (busyScoreColor(score<=2) below), which used to collide visually
+  // with a green free side — grey never collides with any busy-score
+  // color.
+  const uint16_t freeColor = dma_display->color565(150, 150, 150);
   if (dayOverview.hasHours) {
+    const int barX0 = 2, barX1 = W - 2, barY = 18, barH = 4;
+    const float total = dayOverview.hoursBusy + dayOverview.hoursFree;
+    const float busyFrac = total > 0 ? (dayOverview.hoursBusy / total) : 0.0f;
+    const int splitX = barX0 + (int)round(busyFrac * (barX1 - barX0));
+
+    dma_display->fillRect(barX0, barY, barX1 - barX0, barH, dma_display->color565(35, 32, 28)); // track
+    if (splitX > barX0) dma_display->fillRect(barX0, barY, splitX - barX0, barH, scoreColor);
+    if (barX1 > splitX) dma_display->fillRect(splitX, barY, barX1 - splitX, barH, freeColor);
+
     char buf[16];
     snprintf(buf, sizeof(buf), "%.1fH BUSY", dayOverview.hoursBusy);
     String busyHText = buf;
     snprintf(buf, sizeof(buf), "%.1fH FREE", dayOverview.hoursFree);
     String freeHText = buf;
-    dma_display->setTextColor(dma_display->color565(150, 150, 150));
-    dma_display->setCursor(2, 13);
+    dma_display->setTextColor(scoreColor);
+    dma_display->setCursor(barX0, 24);
     dma_display->print(busyHText);
-    dma_display->setTextColor(dma_display->color565(0, 255, 80));
-    dma_display->setCursor(W - 2 - (int)freeHText.length() * 6, 13);
+    dma_display->setTextColor(freeColor);
+    dma_display->setCursor(barX1 - (int)freeHText.length() * 6, 24);
     dma_display->print(freeHText);
   } else {
     dma_display->setTextColor(dma_display->color565(90, 85, 75));
     String tbd = "HOURS DATA COMING SOON";
-    dma_display->setCursor(centerTextX(tbd, 6), 14);
+    dma_display->setCursor(centerTextX(tbd, 6), 22);
     dma_display->print(tbd);
   }
   // Commute/drive row intentionally not shown here any more — there's a
   // dedicated Commuting page for that now.
+}
+
+// Sleep & Alarm — round 91, ported from the HUB75 Twin's renderSleepAlarm()
+// prototype (hub75-twin-publish.html) pixel-for-pixel, same 8PM-9AM sleep
+// window mapping and left/right split (left: bed-wake range + sleep-window
+// bar + nearest nearby event; right: pulsing next-alarm time). hasData
+// gates the real render vs. "coming soon" the same way every other
+// no-backend-yet screen does — see sleepAlarm parsing above.
+const int SLEEP_MID = W / 2;      // 96
+const int SLEEP_L0 = 2, SLEEP_L1 = SLEEP_MID - 4;
+const int SLEEP_R0 = SLEEP_MID + 4, SLEEP_R1 = W - 2;
+
+// Maps a clock time (minutes since midnight) into 0..1 across the fixed
+// 8:00 PM - 9:00 AM sleep window, wrapping times after midnight forward by
+// 24h first so the whole window is one continuous span to place a dot on.
+float sleepWindowFrac(int mins) {
+  const int WIN_START = 20 * 60, WIN_END = 33 * 60; // 8:00 PM .. 9:00 AM (24:00+9:00)
+  int m = mins;
+  if (m < 12 * 60) m += 24 * 60;
+  float frac = (float)(m - WIN_START) / (float)(WIN_END - WIN_START);
+  return max(0.0f, min(1.0f, frac));
+}
+
+void renderSleepAlarm(unsigned long now) {
+  dma_display->clearScreen();
+
+  if (!sleepAlarm.hasData) {
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(dma_display->color565(90, 85, 75));
+    String tbd = "SLEEP DATA COMING SOON";
+    dma_display->setCursor(centerTextX(tbd, 6), 14);
+    dma_display->print(tbd);
+    return;
+  }
+
+  int bedMin = timeToMinutes(sleepAlarm.bedTime), wakeMin = timeToMinutes(sleepAlarm.wakeTime);
+  String rangeText = minutesToClockStr(bedMin) + "-" + minutesToClockStr(wakeMin);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(150, 160, 255));
+  dma_display->setCursor(centerTextXIn(rangeText, 6, SLEEP_L0, SLEEP_L1), 1);
+  dma_display->print(rangeText);
+
+  const int barX0 = SLEEP_L0 + 2, barX1 = SLEEP_L1 - 2, barY = 12, barH = 4;
+  dma_display->fillRect(barX0, barY, barX1 - barX0, barH, dma_display->color565(38, 42, 58));
+  int sleepX0 = barX0 + (int)round(sleepWindowFrac(bedMin) * (barX1 - barX0));
+  int sleepX1 = barX0 + (int)round(sleepWindowFrac(wakeMin) * (barX1 - barX0));
+  dma_display->fillRect(sleepX0, barY, max(1, sleepX1 - sleepX0), barH, dma_display->color565(90, 100, 190));
+
+  const uint16_t lateColor = dma_display->color565(170, 130, 255);
+  const uint16_t earlyColor = dma_display->color565(255, 180, 80);
+  int lateIdx = -1, earlyIdx = -1;
+  for (int i = 0; i < sleepAlarm.numNearbyEvents; i++) {
+    int evX = barX0 + (int)round(sleepWindowFrac(timeToMinutes(sleepAlarm.nearbyEvents[i].time)) * (barX1 - barX0));
+    dma_display->fillCircle(evX, barY + barH / 2, 1, sleepAlarm.nearbyEvents[i].period == "late" ? lateColor : earlyColor);
+    if (sleepAlarm.nearbyEvents[i].period == "late" && lateIdx < 0) lateIdx = i;
+    if (sleepAlarm.nearbyEvents[i].period == "early" && earlyIdx < 0) earlyIdx = i;
+  }
+
+  int shownIdx = -1;
+  if (lateIdx >= 0 && earlyIdx >= 0) shownIdx = ((now / 2600) % 2 == 0) ? lateIdx : earlyIdx;
+  else shownIdx = (lateIdx >= 0) ? lateIdx : earlyIdx;
+
+  if (shownIdx >= 0) {
+    String label = sleepAlarm.nearbyEvents[shownIdx].label;
+    label.toUpperCase();
+    const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
+    while ((int)label.length() * 6 > maxW && label.length() > 0) label = label.substring(0, label.length() - 1);
+    bool late = sleepAlarm.nearbyEvents[shownIdx].period == "late";
+    dma_display->setTextColor(late ? lateColor : earlyColor);
+    dma_display->setCursor(centerTextXIn(label, 6, SLEEP_L0, SLEEP_L1), 22);
+    dma_display->print(label);
+  } else {
+    dma_display->setTextColor(dma_display->color565(100, 100, 100));
+    String none = "NO EVENTS NEARBY";
+    const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
+    while ((int)none.length() * 6 > maxW && none.length() > 0) none = none.substring(0, none.length() - 1);
+    dma_display->setCursor(centerTextXIn(none, 6, SLEEP_L0, SLEEP_L1), 22);
+    dma_display->print(none);
+  }
+
+  for (int y = 2; y < 30; y++) dma_display->drawPixel(SLEEP_MID, y, dma_display->color565(55, 60, 80));
+
+  // Same white->gold pulse convention as the Twin (lerp3([255,255,255],
+  // [255,200,110], pulse)) — red channel stays pinned at 255 throughout.
+  String alarmStr = minutesToClockStr(timeToMinutes(sleepAlarm.nextAlarm));
+  float pulse = ((sin(now / 900.0) + 1) / 2.0) * 0.35;
+  uint8_t ag = (uint8_t)round(255 + (200 - 255) * pulse);
+  uint8_t ab = (uint8_t)round(255 + (110 - 255) * pulse);
+  dma_display->setTextSize(2);
+  dma_display->setTextColor(dma_display->color565(255, ag, ab));
+  dma_display->setCursor(centerTextXIn(alarmStr, 12, SLEEP_R0, SLEEP_R1), 2);
+  dma_display->print(alarmStr);
+
+  dma_display->setTextSize(1);
+  String caption = "NEXT ALARM";
+  dma_display->setTextColor(dma_display->color565(190, 190, 190));
+  dma_display->setCursor(centerTextXIn(caption, 6, SLEEP_R0, SLEEP_R1), 22);
+  dma_display->print(caption);
+}
+
+// ============================================================
+// Wake Up Mode — round 91, ported from the HUB75 Twin's renderWakeUp()
+// pixel-for-pixel: same staged sunrise timeline (black -> navy -> orange
+// horizon -> warm yellow -> "GOOD MORNING"), same timings and colors.
+//
+// The Twin blends stars/halo/text against a live framebuffer it can read
+// back from; earlier this round that read-back gap was the reason Wake Up
+// Mode's port got deferred. On closer look it doesn't actually matter
+// here: every single thing this screen blends against is the sky
+// gradient, and the sky gradient is a pure function of row y and elapsed
+// time t — never something drawn earlier and then sampled back. So each
+// blend point below computes its own background analytically (same top/
+// bot lerp the sky fill itself uses) instead of reading a buffer, and the
+// result is pixel-identical to the Twin's version without needing one.
+// ============================================================
+struct RGBf { float r, g, b; };
+RGBf rgbf(float r, float g, float b) { return { r, g, b }; }
+RGBf lerp3f(RGBf a, RGBf b, float t) { return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t }; }
+float clamp255f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+uint16_t packRGBf(RGBf c) {
+  return dma_display->color565((uint8_t)round(clamp255f(c.r)), (uint8_t)round(clamp255f(c.g)), (uint8_t)round(clamp255f(c.b)));
+}
+float wakeupSmoothstep(float a, float b, float t) {
+  if (t <= a) return 0;
+  if (t >= b) return 1;
+  float x = (t - a) / (b - a);
+  return x * x * (3 - 2 * x);
+}
+// Same hsv->rgb math as the Twin's hsv(h,s,v), kept in float RGB (not
+// packed color565) so it can still be blended precisely below.
+RGBf hsvToRGBf(float h, float s, float v) {
+  h = fmodf(fmodf(h, 360.0f) + 360.0f, 360.0f);
+  float c = (v / 255.0f) * (s / 255.0f);
+  float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+  float m = (v / 255.0f) - c;
+  float r, g, b;
+  if (h < 60) { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  return rgbf((r + m) * 255.0f, (g + m) * 255.0f, (b + m) * 255.0f);
+}
+// Faux-bold: same trick the Twin's drawCharBold used (stretch every lit
+// pixel 1 extra column wide) approximated at the whole-glyph level, since
+// firmware prints through Adafruit_GFX's built-in font rather than the
+// Twin's own per-pixel one — print the string twice, offset 1px in x.
+// setTextSize()/current font are whatever the caller already set.
+void printBold(int x, int y, const String &s, uint16_t color) {
+  dma_display->setTextColor(color);
+  dma_display->setCursor(x, y);
+  dma_display->print(s);
+  dma_display->setCursor(x + 1, y);
+  dma_display->print(s);
+}
+
+const unsigned long WAKEUP_T_BLACK = 1200;     // pure black, just the corner label
+const unsigned long WAKEUP_T_BLUE = 4000;      // navy blues fully faded in, no orange yet
+const unsigned long WAKEUP_T_SUNPOKE = 6500;   // sun's top edge starts breaking the horizon
+const unsigned long WAKEUP_T_ORANGE = 10000;   // sun fully risen to resting height, orange filled in
+const unsigned long WAKEUP_T_YELLOW = 13000;   // whole screen warmed toward yellow, sun at final size
+const unsigned long WAKEUP_T_TEXTFADE = 1500;  // "GOOD MORNING" fade-in duration
+const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~14.5s — settled state begins here
+
+// Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
+// bottom-right landing spot and the top-left corner label.
+struct WakeupStar { int x, y; unsigned long offset, cycle; };
+const WakeupStar WAKEUP_STARS[9] = {
+  { 22,  5,  0,    2600 }, { 60,  10, 1450, 3100 }, { 96,  4,  2600, 2400 },
+  { 128, 14, 500,  3400 }, { 145, 20, 1950, 2900 }, { 40,  18, 950,  2700 },
+  { 78,  22, 2100, 3000 }, { 165, 9,  300,  2500 }, { 110, 25, 1600, 3300 },
+};
+// "Quick rise, slower decay" twinkle curve — same shape as the boot
+// sequence's spark field, reads as an actual twinkle rather than a smooth
+// symmetric sine.
+float wakeupStarTwinkle(unsigned long t, const WakeupStar &star) {
+  long cyc = (long)star.cycle;
+  long m = ((long)(t + star.offset)) % cyc;
+  if (m < 0) m += cyc;
+  float frac = (float)m / (float)cyc;
+  return frac < 0.15f ? frac / 0.15f : pow(1.0f - (frac - 0.15f) / 0.85f, 1.6f);
+}
+
+void renderWakeUp(unsigned long t) {
+  dma_display->clearScreen();
+
+  float blueP        = wakeupSmoothstep(WAKEUP_T_BLACK, WAKEUP_T_BLUE, t);
+  float sunRiseP     = wakeupSmoothstep(WAKEUP_T_BLUE, WAKEUP_T_ORANGE, t);
+  float orangeSpreadP = wakeupSmoothstep(WAKEUP_T_SUNPOKE, WAKEUP_T_ORANGE, t);
+  float yellowP      = wakeupSmoothstep(WAKEUP_T_ORANGE, WAKEUP_T_YELLOW, t);
+  float textP        = wakeupSmoothstep(WAKEUP_T_YELLOW, WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE, t);
+  // The whole sunrise dims to black over the same window GOOD MORNING
+  // fades in, landing on a plain black screen the instant the text is
+  // fully in — Jon: "when good morning hits, I just want good morning."
+  float bgFade = 1.0f - textP;
+
+  // Once settled (past WAKEUP_T_HOLD), a small continuous breathe keeps
+  // the resting screen from looking like a static screenshot.
+  unsigned long holdT = (t > WAKEUP_T_HOLD) ? (t - WAKEUP_T_HOLD) : 0;
+  float glowWobble = sin(holdT / 4000.0f) * 0.06f;
+  float bob = sin(holdT / 1800.0f) * 1.2f;
+
+  // Sky — vertical gradient, staged black -> navy -> orange horizon glow
+  // -> warm yellow, exactly like the Twin.
+  RGBf BLACKC = rgbf(0, 0, 0);
+  RGBf top = lerp3f(BLACKC, rgbf(10, 16, 42), blueP);
+  RGBf bot = lerp3f(BLACKC, rgbf(16, 26, 64), blueP);
+  bot = lerp3f(bot, rgbf(214, 112, 36), orangeSpreadP);
+  top = lerp3f(top, rgbf(120, 108, 74), yellowP);
+  bot = lerp3f(bot, rgbf(255, 196, 80), yellowP);
+  float glowMod = 1.0f + glowWobble;
+  top = rgbf(clamp255f(top.r * glowMod), clamp255f(top.g * glowMod), clamp255f(top.b * glowMod));
+  bot = rgbf(clamp255f(bot.r * glowMod), clamp255f(bot.g * glowMod), clamp255f(bot.b * glowMod));
+  top = lerp3f(BLACKC, top, bgFade);
+  bot = lerp3f(BLACKC, bot, bgFade);
+
+  for (int y = 0; y < H; y++) {
+    float f = (float)y / (float)(H - 1);
+    dma_display->fillRect(0, y, W, 1, packRGBf(lerp3f(top, bot, f)));
+  }
+
+  // Night-sky stars — only during the black/navy opening beat, retired by
+  // starEnvelope before the sunrise itself starts.
+  float starEnvelope = 1.0f - wakeupSmoothstep(WAKEUP_T_BLUE, WAKEUP_T_SUNPOKE, t);
+  if (starEnvelope > 0.01f) {
+    for (int i = 0; i < 9; i++) {
+      const WakeupStar &s = WAKEUP_STARS[i];
+      float alpha = wakeupStarTwinkle(t, s) * starEnvelope;
+      if (alpha <= 0.01f) continue;
+      float rowF = (float)s.y / (float)(H - 1);
+      RGBf bg = lerp3f(top, bot, rowF);
+      dma_display->drawPixel(s.x, s.y, packRGBf(lerp3f(bg, rgbf(255, 255, 255), alpha)));
+    }
+  }
+
+  // Sun — climbs from below the bottom edge to its resting spot in the
+  // bottom-right corner as sunRiseP goes 0->1, growing from nothing to
+  // full size over the same climb, with a modest extra size bump during
+  // the yellow phase. Halo/mid rings are alpha-blended against the sky
+  // (computed analytically per row, per the big comment above); core/
+  // bright are solid, no blending needed.
+  int sunX = W - 26;
+  float sunY = (H + 20) + ((H - 5) - (H + 20)) * sunRiseP + bob;
+  float sizeScale = sunRiseP * (1.0f + 0.2f * yellowP) * bgFade;
+  if (sizeScale > 0.02f) {
+    int rHalo = (int)round(14 * sizeScale), rMid = (int)round(9 * sizeScale);
+    int rCore = max(1, (int)round(5 * sizeScale)), rBright = max(1, (int)round(3 * sizeScale));
+    RGBf haloColor = hsvToRGBf(38, 200, 255);
+    for (int pass = 0; pass < 2; pass++) {
+      int r = pass == 0 ? rHalo : rMid;
+      float alpha = pass == 0 ? 0.10f : 0.22f;
+      if (r <= 0) continue;
+      float rr = (r + 0.5f) * (r + 0.5f);
+      for (int dy = -r; dy <= r; dy++) {
+        int py = (int)round(sunY) + dy;
+        if (py < 0 || py >= H) continue;
+        float rowF = (float)py / (float)(H - 1);
+        RGBf bg = lerp3f(top, bot, rowF);
+        uint16_t blended = packRGBf(lerp3f(bg, haloColor, alpha));
+        for (int dx = -r; dx <= r; dx++) {
+          if (dx * dx + dy * dy > rr) continue;
+          int px = sunX + dx;
+          if (px < 0 || px >= W) continue;
+          dma_display->drawPixel(px, py, blended);
+        }
+      }
+    }
+    dma_display->fillCircle(sunX, (int)round(sunY), rCore, packRGBf(hsvToRGBf(42, 150, 255)));
+    dma_display->fillCircle(sunX, (int)round(sunY), rBright, packRGBf(hsvToRGBf(48, 70, 255)));
+  }
+
+  // Corner label during the intro, "GOOD MORNING" full-screen once the
+  // sequence lands — one crossfades into the other. Both are color-mixed
+  // against the current sky rather than flat-blended, so the fade reads
+  // correctly over the gradient.
+  dma_display->setTextSize(1);
+  if (textP < 0.3f) {
+    RGBf labelColor = lerp3f(top, rgbf(255, 255, 255), 1.0f - (textP / 0.3f));
+    dma_display->setTextColor(packRGBf(labelColor));
+    dma_display->setCursor(4, 2);
+    dma_display->print("WAKE UP MODE");
+  }
+  if (textP > 0.02f) {
+    // "GOOD" / "MORNING" at size 2 are each exactly 16px tall, stacking to
+    // fill the full 32px panel height with no gap. Faux-bold via
+    // printBold(). Once settled, a slow white->gold shimmer keeps it from
+    // looking static now that the background behind it is flat black.
+    RGBf GOLD = rgbf(255, 200, 110);
+    float holdPulse = holdT > 0 ? ((sin(holdT / 1400.0f) + 1) / 2.0f) * 0.18f : 0.0f;
+    const char *lines[2] = { "GOOD", "MORNING" };
+    const int ys[2] = { 0, 16 };
+    dma_display->setTextSize(2);
+    for (int i = 0; i < 2; i++) {
+      String msg = lines[i];
+      float rowF = (float)ys[i] / (float)(H - 1);
+      RGBf msgBg = lerp3f(top, bot, rowF);
+      RGBf color = lerp3f(msgBg, rgbf(255, 255, 255), textP);
+      color = lerp3f(color, GOLD, holdPulse);
+      printBold(centerTextX(msg, 12), ys[i], msg, packRGBf(color));
+    }
+  }
 }
 
 // Whichever of today's events is soonest from right now, wrapping back to
@@ -2609,12 +3054,31 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "news") renderNews(screenElapsed);
   else if (id == "clock") renderClock();
   else if (id == "dayoverview") renderDayOverview();
-  else if (id == "commuting") renderCommuting(screenElapsed);
+  // Round 91 — Jon: "can we also hide the comuting behind a coming soon
+  // page. that car annoys me without real information behind it." Same
+  // hasX-gated pattern as weather/wakeup: the animated jeep only ever had
+  // a real ETA to show once dayOverview.hasCommute is true (there's still
+  // no real commuteMin source today — see the DayOverviewData comment
+  // above), so until then this is just the plain "COMING SOON" card, same
+  // as any other no-data-yet screen. Nothing about renderCommuting() itself
+  // changed — it picks back up automatically the day commuteMin is real.
+  else if (id == "commuting") { if (dayOverview.hasCommute) renderCommuting(screenElapsed); else renderComingSoonFwd(id, now); }
   else if (id == "stars") renderStars(screenElapsed);
   else if (id == "balls") renderBalls(screenElapsed);
   else if (id == "alerts") renderAlert(now);
   else if (id == "offline") renderOffline(now); // preview only — see loop()'s own offline check for the real thing
   else if (id == "weather") { if (hasWeather) renderWeather(screenElapsed); else renderComingSoonFwd(id, now); }
+  // Round 91 — Sleep & Alarm renderer is self-gating (renderSleepAlarm()
+  // shows its own "coming soon" card when sleepAlarm.hasData is false), so
+  // no hasWeather-style check needed here.
+  else if (id == "sleep") renderSleepAlarm(now);
+  // Round 91 — Wake Up Mode is a real, fully animated renderer now (Jon:
+  // "Im confident you can code the animation, id really like to see it on
+  // the pi"). screenElapsed drives it (not `now`/millis()) so the sunrise
+  // intro always restarts from black the moment this screen is entered
+  // (pinned or pushed), the same way every other elapsed-driven screen
+  // here already works.
+  else if (id == "wakeup") renderWakeUp(screenElapsed);
   else renderComingSoonFwd(id, now); // markets, and anything unrecognized
 }
 
