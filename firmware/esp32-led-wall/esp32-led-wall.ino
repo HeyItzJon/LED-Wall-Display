@@ -7,11 +7,13 @@
 //   GET http://<PI_HOST>:<PI_PORT>/api/matrix          (real data, every 30s)
 //   GET http://<PI_HOST>:<PI_PORT>/api/matrix/command   (live control, every 1.5s)
 //
-// Screens: portfolio, events, holdings render real data today. markets,
-// news and weather don't have real renderers/data on the backend yet —
-// they show a "COMING SOON" card (news upgrades itself automatically to a
-// real scrolling ticker the moment /api/matrix ever starts sending a
-// non-empty "news" field — no firmware change needed for that). clock,
+// Screens: portfolio, events, holdings, news, and weather (round 86) render
+// real data today. markets doesn't have a real renderer/data on the backend
+// yet and always shows a "COMING SOON" card. News and Weather each degrade
+// to that same card automatically whenever the backend hasn't sent anything
+// usable yet (no headlines, or no weather block at all) — no firmware
+// change needed if that ever happens again, they just pick back up the
+// moment real data resumes. clock,
 // dayoverview and commuting are firmware-local screens the backend's
 // screen catalog doesn't know about yet, so they always ride along in the
 // rotation regardless of what the web Wall tab has enabled/disabled — see
@@ -195,8 +197,30 @@ struct DayOverviewData {
 };
 DayOverviewData dayOverview;
 
+// Weather — round 86. sources/weather.js's current temp/hi-lo/icon/summary
+// and the hourly icon timeline, replacing the previous COMING SOON
+// placeholder. Ported from the HUB75 Twin (claude/hub75-twin.html, rounds
+// 82-85.1) — see renderWeather() further down for the reference this
+// matches pixel-for-pixel. MAX_WEATHER_HOURLY=24 gives headroom over the
+// real 17-entry (6am-10pm hourly steps) window sources/weather.js's
+// buildHourlySlots() sends today.
+#define MAX_WEATHER_HOURLY 24
+bool hasWeather = false;
+int weatherTempC = 0, weatherHighC = 0, weatherLowC = 0;
+String weatherIcon = "cloud";
+String weatherSummary = "";
+String weatherHourly[MAX_WEATHER_HOURLY];
+int numWeatherHourly = 0;
+
 bool dataValid = false;
 unsigned long lastDataSuccessTime = 0;
+
+// Round 79 — Jon: "error messages that are useful to me with actionable
+// steps or progress indicators." Updated every frame in maintainWifi()
+// while connected; renderOffline() reads "now - this" as how long WiFi's
+// actually been down, instead of just naming the problem with no sense of
+// whether it just started or has been stuck for 20 minutes.
+unsigned long lastWifiConnectedTime = 0;
 
 // ---- Data model: /api/matrix/command ----
 #define MAX_SCREENS 12
@@ -845,7 +869,7 @@ bool connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    drawStatusScreen("WIFI CONNECTED", WiFi.localIP().toString(), millis(), dma_display->color565(0, 255, 120));
+    drawStatusScreen("WIFI CONNECTED", WIFI_SSID, millis(), dma_display->color565(0, 255, 120));
     delay(900);
     return true;
   }
@@ -854,10 +878,17 @@ bool connectWiFi() {
   return false;
 }
 
-// Non-blocking reconnect attempt, called every loop() while WiFi is down.
+// Called every loop() iteration regardless of WiFi state: while connected
+// it just stamps lastWifiConnectedTime (round 79, see comment above that
+// global) and returns; while down it's the non-blocking reconnect attempt
+// it always was, retried every 10s.
 void maintainWifi(unsigned long now) {
   static unsigned long lastAttempt = 0;
-  if (WiFi.status() != WL_CONNECTED && now - lastAttempt > 10000) {
+  if (WiFi.status() == WL_CONNECTED) {
+    lastWifiConnectedTime = now;
+    return;
+  }
+  if (now - lastAttempt > 10000) {
     lastAttempt = now;
     Serial.println("WiFi not connected — attempting reconnect...");
     WiFi.disconnect();
@@ -887,7 +918,9 @@ void pollData() {
     // Bumped 6144 -> 10240 for round 74: markets[]/vix/lastPriceLabel are
     // new fields, MAX_EVENTS grew 8->12, and news headlines are no longer
     // truncated server-side (up to ~90 chars each now instead of 60).
-    DynamicJsonDocument doc(10240);
+    // Bumped 10240 -> 11264 for round 86: weather's summary (up to 200
+    // chars) plus its 17-entry hourly icon array add a few hundred bytes.
+    DynamicJsonDocument doc(11264);
     DeserializationError err = deserializeJson(doc, payload);
 
     if (!err) {
@@ -991,6 +1024,29 @@ void pollData() {
         if (dov.containsKey("commuteMin")) {
           dayOverview.hasCommute = true;
           dayOverview.commuteMin = dov["commuteMin"] | 0;
+        }
+      }
+
+      // Weather — round 86. Ported from the HUB75 Twin (rounds 82-85.1);
+      // see renderWeather() further down for the reference implementation
+      // this was checked against pixel-for-pixel. hasWeather false (no
+      // "weather" key at all yet, fresh install/first pull still pending)
+      // falls back to renderComingSoonFwd via renderScreen()'s dispatch,
+      // same convention as numNews==0 does for the News screen.
+      hasWeather = doc.containsKey("weather") && !doc["weather"].isNull();
+      if (hasWeather) {
+        JsonVariant wv = doc["weather"];
+        weatherTempC   = wv["tempC"] | 0;
+        weatherHighC   = wv["highC"] | 0;
+        weatherLowC    = wv["lowC"]  | 0;
+        weatherIcon    = wv["icon"]  | "cloud";
+        weatherSummary = wv["summary"] | "";
+        numWeatherHourly = 0;
+        if (wv.containsKey("hourly")) {
+          for (JsonVariant h : wv["hourly"].as<JsonArray>()) {
+            if (numWeatherHourly >= MAX_WEATHER_HOURLY) break;
+            weatherHourly[numWeatherHourly++] = h.as<String>();
+          }
         }
       }
 
@@ -1856,6 +1912,415 @@ void renderCommuting(unsigned long elapsed) {
   drawJeepSprite((int)round(jeepX), 1);
 }
 
+// ============================================================
+// Weather — round 86. Real backend data (sources/weather.js's icon
+// buckets/current temp/hi-lo/summary/hourly timeline), ported
+// pixel-for-pixel from the HUB75 Twin browser simulator
+// (claude/hub75-twin.html, rounds 82-85.1) where this whole look was
+// designed and approved before ever touching real firmware — every sprite
+// row, palette value, layout constant, and timing/pulse number below
+// matches that file's renderWeather()/drawWeatherTimeline() exactly.
+// ============================================================
+
+// ---- weather icon sprites — 22px wide, height varies by icon ----
+// Traced from the Twin's WEATHER_SPRITES tables. Each row is a PROGMEM
+// string, one character per pixel column; '.' is transparent (skipped),
+// every other character is a palette key resolved by weatherPaletteColor().
+const char *const WEATHER_SPRITE_SUN[22] PROGMEM = {
+  "......................",
+  "......................",
+  "......................",
+  "..........ll..........",
+  "..........ll..........",
+  ".....ll..llll..ll.....",
+  ".....lllmmmmmmlll.....",
+  "......lmmmmmmmml......",
+  "......mmmmmmmmmm......",
+  ".....lmmmmmmmmmml.....",
+  "...lllmmmmmmmmmmlll...",
+  "...lllmmmmmmmmddlll...",
+  ".....lmmmmmmmdddl.....",
+  "......mmmmmmdddd......",
+  "......lmmmmddddl......",
+  ".....lllmmmdddlll.....",
+  ".....ll..llll..ll.....",
+  "..........ll..........",
+  "..........ll..........",
+  "......................",
+  "......................",
+  "......................",
+};
+const int WEATHER_SUN_H = 22;
+
+const char *const WEATHER_SPRITE_PARTLY_SUNNY[19] PROGMEM = {
+  "......................",
+  "...m.....m............",
+  "...mm...mm............",
+  "....mm.mm.............",
+  "m...mllmm...m.........",
+  ".mmmllllmmmm..........",
+  "..mmllllmmm...........",
+  "...mmllddm............",
+  "..mmmmdddcccc.........",
+  ".mmmmmccccccccc.......",
+  "m...mcccccccccccc.....",
+  "....mcccccccccccc.....",
+  "...ccccccccccccccc....",
+  "..cccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  "..ssssssssssssssssss..",
+  "...sssssssssssssss....",
+  "...sssssssssssssss....",
+};
+const int WEATHER_PARTLY_SUNNY_H = 19;
+
+const char *const WEATHER_SPRITE_CLOUD[13] PROGMEM = {
+  ".........cccc.........",
+  "......ccccccccc.......",
+  ".....cccccccccccc.....",
+  ".....cccccccccccc.....",
+  "...ccccccccccccccc....",
+  "..cccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  "..ssssssssssssssssss..",
+  "...sssssssssssssss....",
+  "...sssssssssssssss....",
+  "......................",
+  "......................",
+};
+const int WEATHER_CLOUD_H = 13;
+
+const char *const WEATHER_SPRITE_RAIN[18] PROGMEM = {
+  ".........cccc.........",
+  "......ccccccccc.......",
+  ".....cccccccccccc.....",
+  ".....cccccccccccc.....",
+  "...ccccccccccccccc....",
+  "..cccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  "..ssssssssssssssssss..",
+  "...sssssssssssssss....",
+  "...sssssssssssssss....",
+  "......................",
+  "....r.........r.......",
+  "...r.....r...r....r...",
+  "........r........r....",
+  "...r.........r........",
+  "..r.....r...r....r....",
+  ".......r........r.....",
+};
+const int WEATHER_RAIN_H = 18;
+
+const char *const WEATHER_SPRITE_SNOW[20] PROGMEM = {
+  ".........cccc.........",
+  "......ccccccccc.......",
+  ".....cccccccccccc.....",
+  ".....cccccccccccc.....",
+  "...ccccccccccccccc....",
+  "..cccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  "..ssssssssssssssssss..",
+  "...sssssssssssssss....",
+  "...sssssssssssssss....",
+  "......................",
+  "....w.....w.....w.....",
+  "...www...www...www....",
+  "....w.....w.....w.....",
+  "......................",
+  ".......n.....n.....n..",
+  "......nnn...nnn...nnn.",
+  ".......n.....n.....n..",
+  "......................",
+};
+const int WEATHER_SNOW_H = 20;
+
+const char *const WEATHER_SPRITE_LIGHTNING[18] PROGMEM = {
+  ".........cccc.........",
+  "......ccccccccc.......",
+  ".....cccccccccccc.....",
+  ".....cccccccccccc.....",
+  "...ccccccccccccccc....",
+  "..cccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  ".ccccccccccccccccccc..",
+  "..ssssssssssssssssss..",
+  "...sssssssssssssss....",
+  "...sssssssssssssss....",
+  "..........ggg.........",
+  "...r.....gg........r..",
+  "..r.....gg........r...",
+  ".........gggg.........",
+  ".....r......gg...r....",
+  "....r......gg...r.....",
+  "..........gg..........",
+};
+const int WEATHER_LIGHTNING_H = 18;
+
+const int WEATHER_ICON_W = 22; // every icon sprite is 22px wide
+
+// Same nine-key sprite palette as the Twin's WEATHER_PALETTE.
+uint16_t weatherPaletteColor(char c) {
+  switch (c) {
+    case 'd': return dma_display->color565(255, 150, 20);  // sun accent, darker orange
+    case 'm': return dma_display->color565(255, 201, 60);  // sun mid tone
+    case 'l': return dma_display->color565(255, 205, 70);  // sun core, lightest
+    case 's': return dma_display->color565(159, 176, 196); // cloud shadow/underside
+    case 'c': return dma_display->color565(223, 235, 244); // cloud body, light
+    case 'r': return dma_display->color565(66, 173, 244);  // rain drop, blue
+    case 'n': return dma_display->color565(196, 222, 245); // snowflake, pale blue-white
+    case 'w': return dma_display->color565(255, 255, 255); // snowflake, white
+    case 'g': return dma_display->color565(255, 210, 0);   // lightning bolt, gold
+    default:  return 0;
+  }
+}
+
+void drawWeatherSpriteRows(const char *const *rows, int rowCount, int x0, int y0) {
+  for (int row = 0; row < rowCount; row++) {
+    // Same PROGMEM convention as JEEP_SPRITE/drawJeepSprite above: on the
+    // ESP32's unified address space PROGMEM is just a placement hint, not
+    // a separate access method the way it is on AVR, so this is a plain,
+    // direct read — no pgm_read_ptr() needed (and this file doesn't use it
+    // anywhere else).
+    const char *line = rows[row];
+    for (int col = 0; col < WEATHER_ICON_W; col++) {
+      char ch = line[col];
+      if (ch == '.' || ch == '\0') continue;
+      dma_display->drawPixel(x0 + col, y0 + row, weatherPaletteColor(ch));
+    }
+  }
+}
+
+// icon bucket -> sprite. Unknown/missing buckets fall back to "cloud",
+// same default sources/weather.js's own iconForWmoCode() uses.
+int weatherIconHeight(const String &icon) {
+  if (icon == "sun") return WEATHER_SUN_H;
+  if (icon == "partly_sunny") return WEATHER_PARTLY_SUNNY_H;
+  if (icon == "rain") return WEATHER_RAIN_H;
+  if (icon == "snow") return WEATHER_SNOW_H;
+  if (icon == "lightning") return WEATHER_LIGHTNING_H;
+  return WEATHER_CLOUD_H; // cloud, and anything unrecognized
+}
+
+void drawWeatherIcon(const String &icon, int x0, int y0) {
+  if (icon == "sun") drawWeatherSpriteRows(WEATHER_SPRITE_SUN, WEATHER_SUN_H, x0, y0);
+  else if (icon == "partly_sunny") drawWeatherSpriteRows(WEATHER_SPRITE_PARTLY_SUNNY, WEATHER_PARTLY_SUNNY_H, x0, y0);
+  else if (icon == "rain") drawWeatherSpriteRows(WEATHER_SPRITE_RAIN, WEATHER_RAIN_H, x0, y0);
+  else if (icon == "snow") drawWeatherSpriteRows(WEATHER_SPRITE_SNOW, WEATHER_SNOW_H, x0, y0);
+  else if (icon == "lightning") drawWeatherSpriteRows(WEATHER_SPRITE_LIGHTNING, WEATHER_LIGHTNING_H, x0, y0);
+  else drawWeatherSpriteRows(WEATHER_SPRITE_CLOUD, WEATHER_CLOUD_H, x0, y0);
+}
+
+// A small drawn ring for the degree mark — same "control every pixel"
+// approach as the icons above, rather than trusting the default font's
+// '°' glyph. fillCircle(r=1) draws a solid 3x3 block; punching the center
+// pixel back to black turns it into a hollow ring.
+void drawWeatherDegreeMark(int x, int y, uint16_t color) {
+  dma_display->fillCircle(x, y, 1, color);
+  dma_display->drawPixel(x, y, dma_display->color565(0, 0, 0));
+}
+
+// ---- hourly timeline bar (rounds 84-85.1) ----
+const int TIMELINE_BAR_H = 6;
+
+// One flat color per row (top row first), by icon bucket — ported from
+// the Twin's TIMELINE_PATTERNS. row is 0..TIMELINE_BAR_H-1.
+uint16_t weatherTimelineRowColor(const String &icon, int row) {
+  const uint16_t YELLOW = dma_display->color565(255, 201, 60);
+  const uint16_t GREY   = dma_display->color565(159, 176, 196);
+  const uint16_t BLUE   = dma_display->color565(66, 173, 244);
+  const uint16_t WHITE  = dma_display->color565(255, 255, 255);
+  const uint16_t RED    = dma_display->color565(255, 30, 20);
+  if (icon == "sun") return YELLOW;
+  if (icon == "partly_sunny") return row < 3 ? YELLOW : GREY; // half yellow, half grey — round 85.1
+  if (icon == "rain") return row < 2 ? GREY : BLUE;
+  if (icon == "snow") return row < 2 ? GREY : WHITE;
+  if (icon == "lightning") {
+    if (row < 2) return GREY;
+    if (row == 2) return BLUE;
+    return RED; // bottom 3 rows — round 85: "too similar to sunny... not clear its significant"
+  }
+  return GREY; // cloud, and anything unrecognized
+}
+
+// scaleColor565() (see the small-helpers section up top) takes separate
+// r/g/b — this unpacks them back out of an already-built color565 value so
+// weatherTimelineRowColor() above can stay a single palette function
+// instead of two parallel r/g/b-and-color565 versions of the same colors.
+uint16_t scaleColor565Packed(uint16_t c, float alpha) {
+  uint8_t r = ((c >> 11) & 0x1F) << 3;
+  uint8_t g = ((c >> 5) & 0x3F) << 2;
+  uint8_t b = (c & 0x1F) << 3;
+  return scaleColor565(r, g, b, alpha);
+}
+
+// Draws the hourly bars across [x0,x1) at row y0, one flat-color column
+// per hour with no gaps, plus a real-time "now" cursor through the bar —
+// same ears+stem shape and partial pulse (0.55-1.0, never fully dark) as
+// the Events screen's own day-timeline now marker (see renderEvents()
+// above), since Jon wants this bar to read as that same kind of timeline.
+// alpha<1 fades bar AND cursor together toward black, for the cross-fade
+// in/out when this swaps places with the ticker text.
+void drawWeatherTimeline(int x0, int x1, int y0, float alpha, unsigned long elapsed) {
+  int n = numWeatherHourly > 0 ? numWeatherHourly : 1;
+  for (int i = 0; i < n; i++) {
+    int bx0 = x0 + (int)round((float)i / n * (x1 - x0));
+    int bx1 = x0 + (int)round((float)(i + 1) / n * (x1 - x0));
+    String icon = numWeatherHourly > 0 ? weatherHourly[i] : "cloud";
+    uint16_t colW = max(1, bx1 - bx0);
+    for (int r = 0; r < TIMELINE_BAR_H; r++) {
+      uint16_t rowColor = scaleColor565Packed(weatherTimelineRowColor(icon, r), alpha);
+      dma_display->fillRect(bx0, y0 + r, colW, 1, rowColor);
+    }
+  }
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 0)) {
+    int nowMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    int cursorX = x0 + (int)round(minutesToFrac(nowMinutes) * (x1 - x0));
+    float nowPulseAlpha = 0.55f + 0.45f * ((sin(elapsed / 260.0) + 1) / 2.0f);
+    // Near-white, slight blue tinge (round 85.1 — Jon: "make the cursor
+    // white, that way theres more contrast, maybe slight yellow or blue
+    // tinge so it shows with snow" — the original gold cursor read too
+    // close to the bar's own yellow/orange tones and barely showed
+    // against solid-white snow columns).
+    uint16_t cursorColor = scaleColor565(222, 236, 255, nowPulseAlpha * alpha);
+    int earTop = y0 - 2, earBottom = y0 + TIMELINE_BAR_H; // 2px above the bar, 1px below it
+    dma_display->fillRect(cursorX - 1, earTop, 3, 1, cursorColor);
+    dma_display->fillRect(cursorX, earTop + 1, 1, earBottom - earTop - 1, cursorColor);
+    dma_display->fillRect(cursorX - 1, earBottom, 3, 1, cursorColor);
+  }
+}
+
+// ---- bottom-band timing (round 85.1) ----
+// Text holds 3s, scrolls (if it needs to) to exactly flush against the
+// right edge — no extra travel past full visibility — holds another 3s,
+// fades to the timeline (10s hold), fades back to text. weatherTextPhaseMs
+// ()/weatherTotalCycleMs() are shared between renderWeather() and
+// weatherRequiredTime() below so the rotation timer and the actual
+// on-screen animation can never drift out of sync — same discipline
+// newsRequiredTime()/buildNewsJoined() use above.
+const float WEATHER_SCROLL_SPEED_PX_MS = 0.02f;
+const unsigned long WEATHER_HOLD_MS = 3000, WEATHER_FADE_MS = 500, WEATHER_TIMELINE_HOLD_MS = 10000;
+
+unsigned long weatherTextPhaseMs(const String &summaryUpper) {
+  int sumW = summaryUpper.length() * 6;
+  int availW = (W - 2) - 2; // matches renderWeather()'s WX_TICKER_X0=2, WX_TICKER_X1=W-2
+  if (sumW <= availW) return WEATHER_HOLD_MS; // sits still, no scroll needed
+  int scrollPx = sumW - availW;
+  return (unsigned long)(WEATHER_HOLD_MS * 2 + scrollPx / WEATHER_SCROLL_SPEED_PX_MS);
+}
+
+unsigned long weatherTotalCycleMs(const String &summaryUpper) {
+  return weatherTextPhaseMs(summaryUpper) + WEATHER_FADE_MS + WEATHER_TIMELINE_HOLD_MS + WEATHER_FADE_MS;
+}
+
+// How long the Weather screen needs to stay up to show one full cycle —
+// the AI summary AND the hourly timeline bar — before rotating away. Same
+// "don't cut it off mid-cycle" reasoning as newsRequiredTime()/
+// holdingsRequiredTime()/eventsRequiredTime() above.
+unsigned long weatherRequiredTime() {
+  if (!hasWeather) return 0;
+  String summaryUpper = weatherSummary; summaryUpper.toUpperCase();
+  return weatherTotalCycleMs(summaryUpper);
+}
+
+void renderWeather(unsigned long elapsed) {
+  dma_display->clearScreen();
+
+  const int WX_TOP_Y0 = 0, WX_TOP_Y1 = 22;                             // top band: icon + temp/hi-lo
+  const int WX_TICKER_X0 = 2, WX_TICKER_X1 = W - 2, WX_TICKER_Y = 24;  // ticker: full width, bottom band
+
+  String icon = weatherIcon;
+  int iconH = weatherIconHeight(icon);
+  const int iconW = WEATHER_ICON_W;
+
+  int tempSize = 2, tempH = 7 * tempSize;
+  String tempText = String(weatherTempC);
+  String hiText = "H:" + String(weatherHighC), loText = "L:" + String(weatherLowC);
+  const int hiloGapRows = 2; // Jon: nudge L down 1px further from H
+  const int hiloStackH = 7 + hiloGapRows + 7;
+  int tempBlockW = (int)tempText.length() * 6 * tempSize + 6; // text + gap + degree dot
+  const int iconGapPx = 8, hiloGapPx = 6; // icon->temp, temp->hi-lo
+  int hiloW = max((int)hiText.length(), (int)loText.length()) * 6;
+
+  // ---- the whole trio (icon, temp, hi-lo) centered as one block ----
+  int groupW = iconW + iconGapPx + tempBlockW + hiloGapPx + hiloW;
+  float groupHalfGap = ((WX_TICKER_X1 - WX_TICKER_X0) - groupW) / 2.0f;
+  int groupX0 = WX_TICKER_X0 + max(0, (int)round(groupHalfGap));
+  float topCenterY = (WX_TOP_Y0 + WX_TOP_Y1) / 2.0f;
+
+  // icon, nudged up 1px for breathing room from the ticker below — only
+  // where it actually has that pixel of headroom to give (sun, the
+  // tallest icon at h=22, already fills the band exactly).
+  int iconX = groupX0;
+  int iconYCentered = (int)round(topCenterY - iconH / 2.0f);
+  int iconY = max(WX_TOP_Y0, iconYCentered - 1);
+  drawWeatherIcon(icon, iconX, iconY);
+
+  // temp, vertically centered on the same axis as the icon
+  int tempX = iconX + iconW + iconGapPx;
+  int tempY = (int)round(topCenterY - tempH / 2.0f);
+  dma_display->setTextSize(tempSize);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setCursor(tempX, tempY);
+  dma_display->print(tempText);
+  // Degree mark: pulses full-on/full-off — same "complete 0-1 sweep" style
+  // as the portfolio LIVE dot, and at that dot's own rate (elapsed/260),
+  // not a slower one (round 85 — Jon: the original slower breathe read as
+  // too sluggish).
+  float degreePulse = (sin(elapsed / 260.0) + 1) / 2.0f;
+  drawWeatherDegreeMark(tempX + (int)tempText.length() * 6 * tempSize, tempY + 2,
+                        scaleColor565(255, 255, 255, degreePulse));
+
+  // hi-lo, stacked H over L, also centered on that same axis
+  int hiloX = tempX + tempBlockW + hiloGapPx;
+  int hiloY0 = (int)round(topCenterY - hiloStackH / 2.0f);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(150, 150, 150));
+  dma_display->setCursor(hiloX, hiloY0);
+  dma_display->print(hiText);
+  dma_display->setCursor(hiloX, hiloY0 + 7 + hiloGapRows);
+  dma_display->print(loText);
+
+  // ---- bottom band: summary ticker alternating with the hourly timeline bar ----
+  String summary = weatherSummary; summary.toUpperCase();
+  int availW = WX_TICKER_X1 - WX_TICKER_X0;
+  int sumW = (int)summary.length() * 6;
+  bool needsScroll = sumW > availW;
+  int scrollPx = sumW - availW;
+  unsigned long textPhaseMs = weatherTextPhaseMs(summary);
+  unsigned long totalCycle = weatherTotalCycleMs(summary);
+  unsigned long t = elapsed % totalCycle;
+  int barY0 = H - 2 - TIMELINE_BAR_H; // bar moved up off the very bottom edge so the cursor's ears fit
+
+  if (t < textPhaseMs) {
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(dma_display->color565(200, 200, 200));
+    if (!needsScroll) {
+      dma_display->setCursor(centerTextX(summary, 6), WX_TICKER_Y);
+      dma_display->print(summary);
+    } else {
+      float x;
+      if (t < WEATHER_HOLD_MS) x = WX_TICKER_X0;
+      else if (t < WEATHER_HOLD_MS + scrollPx / WEATHER_SCROLL_SPEED_PX_MS) x = WX_TICKER_X0 - (t - WEATHER_HOLD_MS) * WEATHER_SCROLL_SPEED_PX_MS;
+      else x = WX_TICKER_X0 - scrollPx;
+      dma_display->setCursor((int)round(x), WX_TICKER_Y);
+      dma_display->print(summary);
+    }
+  } else if (t < textPhaseMs + WEATHER_FADE_MS) {
+    drawWeatherTimeline(WX_TICKER_X0, WX_TICKER_X1, barY0, (float)(t - textPhaseMs) / WEATHER_FADE_MS, elapsed);
+  } else if (t < textPhaseMs + WEATHER_FADE_MS + WEATHER_TIMELINE_HOLD_MS) {
+    drawWeatherTimeline(WX_TICKER_X0, WX_TICKER_X1, barY0, 1.0f, elapsed);
+  } else {
+    unsigned long fadeOutT = t - (textPhaseMs + WEATHER_FADE_MS + WEATHER_TIMELINE_HOLD_MS);
+    drawWeatherTimeline(WX_TICKER_X0, WX_TICKER_X1, barY0, 1.0f - (float)fadeOutT / WEATHER_FADE_MS, elapsed);
+  }
+}
+
 void renderComingSoonFwd(String id, unsigned long now) {
   dma_display->clearScreen();
   String label = id; label.toUpperCase();
@@ -1875,15 +2340,43 @@ void renderComingSoonFwd(String id, unsigned long now) {
 // WiFi down, no data ever received, or data gone stale, each get their own
 // message, same idea as the simulator's editable offlineReason but backed
 // by what's actually true.
+// Round 79 — mm:ss (or h:mm once it's been an hour) for renderOffline()'s
+// "how long has this actually been going on" indicator. Plain ASCII only.
+String formatOfflineDuration(unsigned long ms) {
+  unsigned long s = ms / 1000;
+  if (s < 60) return String(s) + "S";
+  unsigned long m = s / 60;
+  s %= 60;
+  if (m < 60) return String(m) + "M" + String(s) + "S";
+  unsigned long h = m / 60;
+  m %= 60;
+  return String(h) + "H" + String(m) + "M";
+}
+
 void renderOffline(unsigned long now) {
   dma_display->clearScreen();
   uint8_t pulse = (uint8_t)(128 + 127 * sin(now / 300.0));
   drawRectOutlineColor(0, 0, W, H, dma_display->color565(pulse, 0, 0));
 
+  // Round 79 — Jon: "error messages that are useful to me with
+  // actionable steps or progress indicators." Naming the problem alone
+  // didn't say whether it just started or has been stuck for 20 minutes
+  // — appended here as "REASON - Xm Ys", reusing lastWifiConnectedTime /
+  // lastDataSuccessTime (both already tracked for other reasons) rather
+  // than adding new bookkeeping.
   String reason;
-  if (WiFi.status() != WL_CONNECTED) reason = "WIFI DISCONNECTED";
-  else if (!dataValid) reason = "NO DATA YET";
-  else reason = "CAN'T REACH PI";
+  unsigned long since;
+  if (WiFi.status() != WL_CONNECTED) {
+    reason = "WIFI DISCONNECTED";
+    since = now - lastWifiConnectedTime;
+  } else if (!dataValid) {
+    reason = "NO DATA YET";
+    since = now - lastDataSuccessTime;
+  } else {
+    reason = "CAN'T REACH PI";
+    since = now - lastDataSuccessTime;
+  }
+  reason += " - " + formatOfflineDuration(since);
 
   dma_display->setTextSize(1);
   dma_display->setTextColor(dma_display->color565(255, 150, 150));
@@ -2055,7 +2548,8 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "balls") renderBalls(screenElapsed);
   else if (id == "alerts") renderAlert(now);
   else if (id == "offline") renderOffline(now); // preview only — see loop()'s own offline check for the real thing
-  else renderComingSoonFwd(id, now); // weather, and anything unrecognized
+  else if (id == "weather") { if (hasWeather) renderWeather(screenElapsed); else renderComingSoonFwd(id, now); }
+  else renderComingSoonFwd(id, now); // markets, and anything unrecognized
 }
 
 // ============================================================
@@ -2110,7 +2604,22 @@ void setup() {
   mxconfig.double_buff = true;
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
-  dma_display->begin();
+
+  // Round 79 — see the comment above this section in the round-79
+  // handoff doc for the full story. 4 attempts, ~1.2s worst case, before
+  // giving up and restarting the board.
+  bool displayReady = dma_display->begin();
+  for (int attempt = 1; !displayReady && attempt < 4; attempt++) {
+    Serial.printf("Display init failed (attempt %d/4) — retrying...\n", attempt);
+    delay(400);
+    displayReady = dma_display->begin();
+  }
+  if (!displayReady) {
+    Serial.println("Display init failed after 4 attempts — restarting board");
+    delay(500);
+    ESP.restart();
+  }
+
   dma_display->setBrightness8(90);
   dma_display->clearScreen();
   dma_display->setTextWrap(false);
@@ -2231,6 +2740,14 @@ void loop() {
     if (currentScreenId == "events" && targetId != "events") {
       unsigned long needed = max((unsigned long)ROTATION_MS, eventsRequiredTime());
       if (now - currentScreenStart < needed) targetId = "events";
+    }
+    // Weather — round 86, same "don't cut it off mid-cycle" extension as
+    // News/Holdings/Markets/Events above: the Weather cycle covers both
+    // the AI summary (which can itself need to scroll) and the hourly
+    // timeline bar, and easily runs longer than one fixed rotation slot.
+    if (currentScreenId == "weather" && targetId != "weather") {
+      unsigned long needed = max((unsigned long)ROTATION_MS, weatherRequiredTime());
+      if (now - currentScreenStart < needed) targetId = "weather";
     }
   }
 
