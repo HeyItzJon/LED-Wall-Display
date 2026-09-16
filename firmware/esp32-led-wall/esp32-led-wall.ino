@@ -346,6 +346,94 @@ uint16_t scaleColor565(uint8_t r, uint8_t g, uint8_t b, float alpha) {
   return dma_display->color565((uint8_t)(r * alpha), (uint8_t)(g * alpha), (uint8_t)(b * alpha));
 }
 
+// ============================================================
+// Wake Up Mode helpers — round 91. Kept up here (not next to
+// renderWakeUp() itself, down in the screen-renderers section) because
+// Arduino auto-generates a prototype for every function ahead of where
+// it's actually called, and a function that takes/returns a custom struct
+// by value (RGBf below) needs that struct's full definition already
+// visible at the point its auto-generated prototype gets inserted — not
+// just before the function body. Learned this the hard way: the first
+// version of this code lived right next to renderWakeUp() and failed to
+// compile with "'RGBf' does not name a type" from Arduino's own hoisted
+// prototypes. Putting the type and every function that touches it up here
+// with the other small helpers/structs sidesteps the whole problem.
+//
+// Every blend renderWakeUp() does is against the sky gradient, and that
+// gradient is a pure function of row y and elapsed time — never something
+// drawn earlier and then read back — so these helpers work in plain float
+// RGB triples (never packed to color565 until the final pixel write) and
+// there's no framebuffer-readback dependency anywhere in here.
+struct RGBf { float r, g, b; };
+RGBf rgbf(float r, float g, float b) { return { r, g, b }; }
+RGBf lerp3f(RGBf a, RGBf b, float t) { return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t }; }
+float clamp255f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+uint16_t packRGBf(RGBf c) {
+  return dma_display->color565((uint8_t)round(clamp255f(c.r)), (uint8_t)round(clamp255f(c.g)), (uint8_t)round(clamp255f(c.b)));
+}
+float wakeupSmoothstep(float a, float b, float t) {
+  if (t <= a) return 0;
+  if (t >= b) return 1;
+  float x = (t - a) / (b - a);
+  return x * x * (3 - 2 * x);
+}
+// Same hsv->rgb math as the Twin's hsv(h,s,v), kept in float RGB (not
+// packed color565) so it can still be blended precisely below.
+RGBf hsvToRGBf(float h, float s, float v) {
+  h = fmodf(fmodf(h, 360.0f) + 360.0f, 360.0f);
+  float c = (v / 255.0f) * (s / 255.0f);
+  float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+  float m = (v / 255.0f) - c;
+  float r, g, b;
+  if (h < 60) { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  return rgbf((r + m) * 255.0f, (g + m) * 255.0f, (b + m) * 255.0f);
+}
+// Faux-bold: same trick the Twin's drawCharBold used (stretch every lit
+// pixel 1 extra column wide) approximated at the whole-glyph level, since
+// firmware prints through Adafruit_GFX's built-in font rather than the
+// Twin's own per-pixel one — print the string twice, offset 1px in x.
+// Also used by renderDayOverview()'s bold busy-score number, further down.
+// setTextSize()/current font are whatever the caller already set.
+void printBold(int x, int y, const String &s, uint16_t color) {
+  dma_display->setTextColor(color);
+  dma_display->setCursor(x, y);
+  dma_display->print(s);
+  dma_display->setCursor(x + 1, y);
+  dma_display->print(s);
+}
+
+const unsigned long WAKEUP_T_BLACK = 1200;     // pure black, just the corner label
+const unsigned long WAKEUP_T_BLUE = 4000;      // navy blues fully faded in, no orange yet
+const unsigned long WAKEUP_T_SUNPOKE = 6500;   // sun's top edge starts breaking the horizon
+const unsigned long WAKEUP_T_ORANGE = 10000;   // sun fully risen to resting height, orange filled in
+const unsigned long WAKEUP_T_YELLOW = 13000;   // whole screen warmed toward yellow, sun at final size
+const unsigned long WAKEUP_T_TEXTFADE = 1500;  // "GOOD MORNING" fade-in duration
+const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~14.5s — settled state begins here
+
+// Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
+// bottom-right landing spot and the top-left corner label.
+struct WakeupStar { int x, y; unsigned long offset, cycle; };
+const WakeupStar WAKEUP_STARS[9] = {
+  { 22,  5,  0,    2600 }, { 60,  10, 1450, 3100 }, { 96,  4,  2600, 2400 },
+  { 128, 14, 500,  3400 }, { 145, 20, 1950, 2900 }, { 40,  18, 950,  2700 },
+  { 78,  22, 2100, 3000 }, { 165, 9,  300,  2500 }, { 110, 25, 1600, 3300 },
+};
+// "Quick rise, slower decay" twinkle curve — same shape as the boot
+// sequence's spark field, reads as an actual twinkle rather than a smooth
+// symmetric sine.
+float wakeupStarTwinkle(unsigned long t, const WakeupStar &star) {
+  long cyc = (long)star.cycle;
+  long m = ((long)(t + star.offset)) % cyc;
+  if (m < 0) m += cyc;
+  float frac = (float)m / (float)cyc;
+  return frac < 0.15f ? frac / 0.15f : pow(1.0f - (frac - 0.15f) / 0.85f, 1.6f);
+}
+
 int centerTextX(const String &s, int charWidthPx) {
   int w = s.length() * charWidthPx;
   int x = (W - w) / 2;
@@ -1922,9 +2010,13 @@ void renderDayOverview() {
   dma_display->fillCircle(dotX, dotY, dotR, scoreColor);
   dma_display->setTextSize(1);
   String scoreStr = String(score);
-  dma_display->setTextColor(dma_display->color565(255, 255, 255));
-  dma_display->setCursor(dotX - (int)round(scoreStr.length() * 6 / 2.0), dotY - 3);
-  dma_display->print(scoreStr);
+  // Round 91 follow-up — Jon: "move that number inside the busy score
+  // circle one pixel to the right and make it as bright white as
+  // possible. can we make it bold?" Nudged +1px, printed via printBold()
+  // (same faux-bold trick as Wake Up Mode's GOOD MORNING text) instead of
+  // a single plain print, full 255,255,255 white (already the max).
+  int scoreX = dotX - (int)round(scoreStr.length() * 6 / 2.0) + 1;
+  printBold(scoreX, dotY - 3, scoreStr, dma_display->color565(255, 255, 255));
 
   String busyText = "BUSY SCORE";
   dma_display->setTextColor(scoreColor);
@@ -2074,89 +2166,16 @@ void renderSleepAlarm(unsigned long now) {
 }
 
 // ============================================================
-// Wake Up Mode — round 91, ported from the HUB75 Twin's renderWakeUp()
-// pixel-for-pixel: same staged sunrise timeline (black -> navy -> orange
-// horizon -> warm yellow -> "GOOD MORNING"), same timings and colors.
-//
-// The Twin blends stars/halo/text against a live framebuffer it can read
-// back from; earlier this round that read-back gap was the reason Wake Up
-// Mode's port got deferred. On closer look it doesn't actually matter
-// here: every single thing this screen blends against is the sky
-// gradient, and the sky gradient is a pure function of row y and elapsed
-// time t — never something drawn earlier and then sampled back. So each
-// blend point below computes its own background analytically (same top/
-// bot lerp the sky fill itself uses) instead of reading a buffer, and the
-// result is pixel-identical to the Twin's version without needing one.
+// Wake Up Mode's screen renderer — round 91, ported from the HUB75 Twin's
+// renderWakeUp() pixel-for-pixel: same staged sunrise timeline (black ->
+// navy -> orange horizon -> warm yellow -> "GOOD MORNING"), same timings
+// and colors. Its own helper types/functions (RGBf, WakeupStar, and the
+// blend/color-math helpers) live up in the "Small helpers" section near
+// the top of this file, not here — Arduino auto-generates a prototype for
+// every function using whatever precedes it, and a struct-by-value
+// parameter like `RGBf` needs the struct fully defined before that
+// auto-generated prototype, not just before this function.
 // ============================================================
-struct RGBf { float r, g, b; };
-RGBf rgbf(float r, float g, float b) { return { r, g, b }; }
-RGBf lerp3f(RGBf a, RGBf b, float t) { return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t }; }
-float clamp255f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
-uint16_t packRGBf(RGBf c) {
-  return dma_display->color565((uint8_t)round(clamp255f(c.r)), (uint8_t)round(clamp255f(c.g)), (uint8_t)round(clamp255f(c.b)));
-}
-float wakeupSmoothstep(float a, float b, float t) {
-  if (t <= a) return 0;
-  if (t >= b) return 1;
-  float x = (t - a) / (b - a);
-  return x * x * (3 - 2 * x);
-}
-// Same hsv->rgb math as the Twin's hsv(h,s,v), kept in float RGB (not
-// packed color565) so it can still be blended precisely below.
-RGBf hsvToRGBf(float h, float s, float v) {
-  h = fmodf(fmodf(h, 360.0f) + 360.0f, 360.0f);
-  float c = (v / 255.0f) * (s / 255.0f);
-  float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
-  float m = (v / 255.0f) - c;
-  float r, g, b;
-  if (h < 60) { r = c; g = x; b = 0; }
-  else if (h < 120) { r = x; g = c; b = 0; }
-  else if (h < 180) { r = 0; g = c; b = x; }
-  else if (h < 240) { r = 0; g = x; b = c; }
-  else if (h < 300) { r = x; g = 0; b = c; }
-  else { r = c; g = 0; b = x; }
-  return rgbf((r + m) * 255.0f, (g + m) * 255.0f, (b + m) * 255.0f);
-}
-// Faux-bold: same trick the Twin's drawCharBold used (stretch every lit
-// pixel 1 extra column wide) approximated at the whole-glyph level, since
-// firmware prints through Adafruit_GFX's built-in font rather than the
-// Twin's own per-pixel one — print the string twice, offset 1px in x.
-// setTextSize()/current font are whatever the caller already set.
-void printBold(int x, int y, const String &s, uint16_t color) {
-  dma_display->setTextColor(color);
-  dma_display->setCursor(x, y);
-  dma_display->print(s);
-  dma_display->setCursor(x + 1, y);
-  dma_display->print(s);
-}
-
-const unsigned long WAKEUP_T_BLACK = 1200;     // pure black, just the corner label
-const unsigned long WAKEUP_T_BLUE = 4000;      // navy blues fully faded in, no orange yet
-const unsigned long WAKEUP_T_SUNPOKE = 6500;   // sun's top edge starts breaking the horizon
-const unsigned long WAKEUP_T_ORANGE = 10000;   // sun fully risen to resting height, orange filled in
-const unsigned long WAKEUP_T_YELLOW = 13000;   // whole screen warmed toward yellow, sun at final size
-const unsigned long WAKEUP_T_TEXTFADE = 1500;  // "GOOD MORNING" fade-in duration
-const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~14.5s — settled state begins here
-
-// Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
-// bottom-right landing spot and the top-left corner label.
-struct WakeupStar { int x, y; unsigned long offset, cycle; };
-const WakeupStar WAKEUP_STARS[9] = {
-  { 22,  5,  0,    2600 }, { 60,  10, 1450, 3100 }, { 96,  4,  2600, 2400 },
-  { 128, 14, 500,  3400 }, { 145, 20, 1950, 2900 }, { 40,  18, 950,  2700 },
-  { 78,  22, 2100, 3000 }, { 165, 9,  300,  2500 }, { 110, 25, 1600, 3300 },
-};
-// "Quick rise, slower decay" twinkle curve — same shape as the boot
-// sequence's spark field, reads as an actual twinkle rather than a smooth
-// symmetric sine.
-float wakeupStarTwinkle(unsigned long t, const WakeupStar &star) {
-  long cyc = (long)star.cycle;
-  long m = ((long)(t + star.offset)) % cyc;
-  if (m < 0) m += cyc;
-  float frac = (float)m / (float)cyc;
-  return frac < 0.15f ? frac / 0.15f : pow(1.0f - (frac - 0.15f) / 0.85f, 1.6f);
-}
-
 void renderWakeUp(unsigned long t) {
   dma_display->clearScreen();
 
