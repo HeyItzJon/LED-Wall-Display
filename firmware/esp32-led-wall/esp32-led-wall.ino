@@ -49,6 +49,11 @@
 #include <ArduinoJson.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <time.h>
+// RGBf/WakeupStar live in this header, not down in the file with the rest
+// of the Wake Up Mode helpers — see WakeupTypes.h's own comment for why
+// (Arduino's auto-prototype hoisting needs them visible up here, not just
+// "early" within the .ino itself).
+#include "WakeupTypes.h"
 
 // ---- WiFi ----
 const char* WIFI_SSID     = "Adidas";   // capital A — case-sensitive, this is the actual fix
@@ -348,23 +353,24 @@ uint16_t scaleColor565(uint8_t r, uint8_t g, uint8_t b, float alpha) {
 
 // ============================================================
 // Wake Up Mode helpers — round 91. Kept up here (not next to
-// renderWakeUp() itself, down in the screen-renderers section) because
-// Arduino auto-generates a prototype for every function ahead of where
-// it's actually called, and a function that takes/returns a custom struct
-// by value (RGBf below) needs that struct's full definition already
-// visible at the point its auto-generated prototype gets inserted — not
-// just before the function body. Learned this the hard way: the first
-// version of this code lived right next to renderWakeUp() and failed to
-// compile with "'RGBf' does not name a type" from Arduino's own hoisted
-// prototypes. Putting the type and every function that touches it up here
-// with the other small helpers/structs sidesteps the whole problem.
+// renderWakeUp() itself, down in the screen-renderers section) purely for
+// readability, grouped with the other small helpers/structs. The actual
+// compile-order fix lives in WakeupTypes.h: RGBf and WakeupStar are
+// defined there and #include'd up at the top of this file, not here —
+// moving the struct definitions further up WITHIN this .ino (which is
+// what the first attempt at this fix did) still failed with the same
+// "'RGBf' does not name a type" error, because Arduino's auto-prototype
+// generator hoists a prototype for every function in this .ino to one
+// fixed point near the very top of the file, before ANY of this file's
+// own code — not "before the function's own definition." A header
+// #include'd in the leading block up top is the one thing guaranteed to
+// be visible by then; see WakeupTypes.h's comment for the full story.
 //
 // Every blend renderWakeUp() does is against the sky gradient, and that
 // gradient is a pure function of row y and elapsed time — never something
 // drawn earlier and then read back — so these helpers work in plain float
 // RGB triples (never packed to color565 until the final pixel write) and
 // there's no framebuffer-readback dependency anywhere in here.
-struct RGBf { float r, g, b; };
 RGBf rgbf(float r, float g, float b) { return { r, g, b }; }
 RGBf lerp3f(RGBf a, RGBf b, float t) { return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t }; }
 float clamp255f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
@@ -416,8 +422,8 @@ const unsigned long WAKEUP_T_TEXTFADE = 1500;  // "GOOD MORNING" fade-in duratio
 const unsigned long WAKEUP_T_HOLD = WAKEUP_T_YELLOW + WAKEUP_T_TEXTFADE; // ~14.5s — settled state begins here
 
 // Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
-// bottom-right landing spot and the top-left corner label.
-struct WakeupStar { int x, y; unsigned long offset, cycle; };
+// bottom-right landing spot and the top-left corner label. (WakeupStar
+// itself is defined in WakeupTypes.h — see that file's comment.)
 const WakeupStar WAKEUP_STARS[9] = {
   { 22,  5,  0,    2600 }, { 60,  10, 1450, 3100 }, { 96,  4,  2600, 2400 },
   { 128, 14, 500,  3400 }, { 145, 20, 1950, 2900 }, { 40,  18, 950,  2700 },
