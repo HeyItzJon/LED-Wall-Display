@@ -2034,19 +2034,21 @@ void renderDayOverview() {
   dma_display->fillCircle(dotX, dotY, dotR, scoreColor);
   dma_display->setTextSize(1);
   String scoreStr = String(score);
-  // Round 91 follow-up — Jon: "move that number inside the busy score
-  // circle one pixel to the right and make it as bright white as
-  // possible. can we make it bold?" Nudged +1px, printed via printBold()
-  // (same faux-bold trick as Wake Up Mode's GOOD MORNING text) instead of
-  // a single plain print.
-  // Round 91 follow-up #2 — Jon: "in black (so no pixels)... make sure it
-  // is still painted on the circle so that we have a number." Was
+  // Round 91 follow-up — nudged +1px per Jon's original ask. Went through
+  // printBold() (faux-bold, same trick as Wake Up Mode's GOOD MORNING) for
+  // a stretch, but at this single-digit size-1 scale the 1px-offset double
+  // print just muddied the glyph instead of reading as bold — Jon: "back
+  // to regular text, bold isnt really working." Plain single print now.
+  // Round 91 follow-up — Jon: "in black (so no pixels)... make sure it is
+  // still painted on the circle so that we have a number." Was
   // white-on-color; now explicitly painted black so the digit reads as a
   // punched-out cutout in the lit circle rather than a bright overlay on
   // it — still drawn (not left as background), just black instead of
   // white pixels.
   int scoreX = dotX - (int)round(scoreStr.length() * 6 / 2.0) + 1;
-  printBold(scoreX, dotY - 3, scoreStr, dma_display->color565(0, 0, 0));
+  dma_display->setTextColor(dma_display->color565(0, 0, 0));
+  dma_display->setCursor(scoreX, dotY - 3);
+  dma_display->print(scoreStr);
 
   String busyText = "BUSY SCORE";
   dma_display->setTextColor(scoreColor);
