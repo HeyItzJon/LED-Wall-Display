@@ -54,6 +54,14 @@
 // (Arduino's auto-prototype hoisting needs them visible up here, not just
 // "early" within the .ino itself).
 #include "WakeupTypes.h"
+// Same fix, different structs — EventItem/Spark/ExcludeRect/EventPlan/
+// AllDayPlan/StripCmd/NotifCmd/AlertLevel used to live directly in this
+// .ino (see the old "Struct types used across screens" comment, still
+// findable in git history) under the theory that being "near the top" was
+// enough. It wasn't — same class of "'X' does not name a type" compile
+// error WakeupTypes.h exists to fix, just for a different batch of
+// structs. See ScreenTypes.h's own comment for the full mechanism.
+#include "ScreenTypes.h"
 
 // ---- WiFi ----
 const char* WIFI_SSID     = "Adidas";   // capital A — case-sensitive, this is the actual fix
@@ -182,14 +190,9 @@ void logFrameDiagnostics(unsigned long frameStartUs, unsigned long now) {
 #define MAX_NEWS 6
 #define MAX_MARKETS 6
 
-struct EventItem {
-  String time;
-  String title;
-  String busyLevel;  // "busy" | "medium" | "light" — always sent today
-  String cal;        // "work"/"school"/"personal"/"important"/"cannotmiss"/"tests" — NOT sent yet, see handoff doc
-  String desc;        // NOT sent yet, see handoff doc
-  int    dur;          // minutes — NOT sent yet, defaults to 30
-};
+// EventItem itself now lives in ScreenTypes.h (#include'd up top) — see
+// that file's comment for why. This array declaration is unaffected;
+// EventItem is fully visible here either way.
 EventItem events[MAX_EVENTS];
 int numEvents = 0;
 
@@ -353,30 +356,23 @@ unsigned long forceScreenStart = 0;
 unsigned long notifyStart = 0;
 
 // ---- Struct types used across screens ----
-// These are declared up here, before any function definitions, on purpose:
-// the Arduino build's auto-generated function-prototype step inserts
-// forward declarations near the top of the file, and if a struct used as
-// a parameter type is defined further down (after the point where its
-// function is first used), that auto-prototype fails to compile with
-// "X was not declared in this scope" / "X does not name a type" even
-// though the actual function definition is in a perfectly valid order.
-// Keep every custom struct type up here to avoid that class of error.
-struct Spark { float x, y, life, maxLife, peak; };
-struct ExcludeRect { int x0, x1, y0, y1; };
+// Spark/ExcludeRect/EventPlan/AllDayPlan/StripCmd/NotifCmd/AlertLevel used
+// to be declared right here, on the theory that "before any function
+// definitions" within the .ino was enough to dodge Arduino's auto-prototype
+// hoisting. It wasn't (that hoisting point sits before ANY of this file's
+// own code, not before each function's own definition — see
+// ScreenTypes.h's comment for the full mechanism) — they now live in
+// ScreenTypes.h (#include'd up top) instead, alongside WakeupTypes.h.
+//
+// Ball and BootTiming stay right here, unmoved: neither is ever used as a
+// function's parameter or return type (only as plain variable types), so
+// neither was ever actually subject to this bug — no reason to relocate
+// what was never broken.
 struct Ball { float x, y, vx, vy, r; uint16_t color; };
 struct BootTiming {
   unsigned long starsFadeIn = 1000, starsHold = 2000, helloFade = 500, helloHold = 400, subFade = 500, finalHold = 6000;
   unsigned long t1, t2, t3, t4, t5, t6;
 };
-struct EventPlan { String cap, desc; int capOverflow, descOverflow; unsigned long dur; };
-// Round 76 — declared here (not next to computeAllDayPlan() below, where
-// it's actually used) for the same reason EventPlan above is: Arduino's
-// auto-generated function prototypes are inserted near the TOP of the
-// sketch, before any type declared further down would be visible yet.
-struct AllDayPlan { String cap; int capOverflow; unsigned long dur; };
-struct StripCmd { bool isIcon; int x, y, w, h; String text; uint32_t iconCp; uint16_t color; };
-struct NotifCmd { bool isIcon; int x, w; String text; uint32_t cp; };
-struct AlertLevel { uint8_t ar, ag, ab, br, bg, bb, tr, tg, tb; };
 
 // ============================================================
 // Small helpers
