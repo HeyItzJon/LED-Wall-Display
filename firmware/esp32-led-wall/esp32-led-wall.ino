@@ -2191,7 +2191,85 @@ float sleepWindowFrac(int mins) {
   return max(0.0f, min(1.0f, frac));
 }
 
-void renderSleepAlarm(unsigned long now) {
+// Nearby-event label ticker — same hold-scroll-hold discipline as Commute
+// Stats' insight ticker (see commuteStatsTickerCycleMs below), but sized to
+// this label's own half-screen column instead of the whole board, and
+// paired with an explicit black mask afterward: unlike Commute Stats'
+// ticker (which just scrolls off the physical edge of the display),
+// overflow here would otherwise bleed across the sleep/alarm divider into
+// the other half.
+const float SLEEP_SCROLL_SPEED_PX_MS = 0.02f;
+const unsigned long SLEEP_HOLD_MS = 2600; // matches the previous late/early swap cadence
+
+// Shared with sleepAlarmRequiredTime() below so the rotation timer and the
+// actual on-screen scroll can never drift apart — same discipline
+// commuteStatsTickerCycleMs()/newsRequiredTime() use for their screens.
+unsigned long sleepLabelTickerCycleMs(const String &textUpper, int availW) {
+  int textW = (int)textUpper.length() * 6;
+  if (textW <= availW) return SLEEP_HOLD_MS; // sits still, nothing to scroll
+  int scrollPx = textW - availW;
+  return SLEEP_HOLD_MS * 2 + (unsigned long)(scrollPx / SLEEP_SCROLL_SPEED_PX_MS);
+}
+
+// Draws one nearby-event label (or the "no events nearby" placeholder)
+// inside [x0,x1] at row y, scrolling if it doesn't fit. localElapsed is
+// time-within-THIS-label's-own slot (see renderSleepAlarm's late/early
+// selection below), so a label that needs the full hold-scroll-hold cycle
+// always gets to finish it before the display swaps to whatever's shown
+// next — the same "don't cut it off mid-cycle" guarantee
+// commuteStatsRequiredTime()/newsRequiredTime() give their own screens.
+void drawSleepLabel(const String &textUpper, int x0, int x1, int y, unsigned long localElapsed, uint16_t color) {
+  int availW = (x1 - x0) - 4;
+  int textW = (int)textUpper.length() * 6;
+  dma_display->setTextColor(color);
+  if (textW <= availW) {
+    dma_display->setCursor(centerTextXIn(textUpper, 6, x0, x1), y);
+    dma_display->print(textUpper);
+    return;
+  }
+  int scrollPx = textW - availW;
+  float x;
+  if (localElapsed < SLEEP_HOLD_MS) x = x0 + 2;
+  else if (localElapsed < SLEEP_HOLD_MS + scrollPx / SLEEP_SCROLL_SPEED_PX_MS) x = (x0 + 2) - (localElapsed - SLEEP_HOLD_MS) * SLEEP_SCROLL_SPEED_PX_MS;
+  else x = (x0 + 2) - scrollPx;
+  dma_display->setCursor((int)round(x), y);
+  dma_display->print(textUpper);
+  // Mask anything that scrolled outside this label's own column so it can
+  // never bleed across the divider into the alarm half — same fillRect-as-
+  // curtain trick renderCommuting() already uses for its reveal wipe.
+  dma_display->fillRect(0, y, x0, 8, dma_display->color565(0, 0, 0));
+  dma_display->fillRect(x1, y, W - x1, 8, dma_display->color565(0, 0, 0));
+}
+
+// How long the Sleep & Alarm screen needs to show its nearby event(s) at
+// least once before rotating away — 0 (no extension) when "no events
+// nearby" fits statically, same "nothing to protect" convention
+// weatherRequiredTime()/commuteStatsRequiredTime() follow when there's
+// nothing to scroll. When both a late and an early event exist, each gets
+// its own full slot (see renderSleepAlarm), so the required time is both
+// their cycles added together.
+unsigned long sleepAlarmRequiredTime() {
+  if (!sleepAlarm.hasData) return 0;
+  int lateIdx = -1, earlyIdx = -1;
+  for (int i = 0; i < sleepAlarm.numNearbyEvents; i++) {
+    if (sleepAlarm.nearbyEvents[i].period == "late" && lateIdx < 0) lateIdx = i;
+    if (sleepAlarm.nearbyEvents[i].period == "early" && earlyIdx < 0) earlyIdx = i;
+  }
+  if (lateIdx < 0 && earlyIdx < 0) return 0;
+  const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
+  unsigned long total = 0;
+  if (lateIdx >= 0) {
+    String l = sleepAlarm.nearbyEvents[lateIdx].label; l.toUpperCase();
+    total += sleepLabelTickerCycleMs(l, maxW);
+  }
+  if (earlyIdx >= 0) {
+    String l = sleepAlarm.nearbyEvents[earlyIdx].label; l.toUpperCase();
+    total += sleepLabelTickerCycleMs(l, maxW);
+  }
+  return total;
+}
+
+void renderSleepAlarm(unsigned long elapsed, unsigned long now) {
   dma_display->clearScreen();
 
   // Round 91 follow-up — Jon: "the sleep mode placeholder to be like the
@@ -2199,7 +2277,10 @@ void renderSleepAlarm(unsigned long now) {
   // real backend data source for sleep/alarm yet (same boat markets/news
   // used to be in), so this uses the same generic rainbow-label "COMING
   // SOON" card everything else without real data falls back to, instead
-  // of a bespoke placeholder.
+  // of a bespoke placeholder. renderComingSoonFwd is shared across every
+  // no-data screen and keyed to absolute `now` like all its other callers
+  // (see renderScreen below) — only the real render past this point
+  // switches to `elapsed`.
   if (!sleepAlarm.hasData) {
     renderComingSoonFwd("sleep", now);
     return;
@@ -2228,34 +2309,46 @@ void renderSleepAlarm(unsigned long now) {
     if (sleepAlarm.nearbyEvents[i].period == "early" && earlyIdx < 0) earlyIdx = i;
   }
 
-  int shownIdx = -1;
-  if (lateIdx >= 0 && earlyIdx >= 0) shownIdx = ((now / 2600) % 2 == 0) ? lateIdx : earlyIdx;
-  else shownIdx = (lateIdx >= 0) ? lateIdx : earlyIdx;
-
-  if (shownIdx >= 0) {
-    String label = sleepAlarm.nearbyEvents[shownIdx].label;
-    label.toUpperCase();
-    const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
-    while ((int)label.length() * 6 > maxW && label.length() > 0) label = label.substring(0, label.length() - 1);
-    bool late = sleepAlarm.nearbyEvents[shownIdx].period == "late";
-    dma_display->setTextColor(late ? lateColor : earlyColor);
-    dma_display->setCursor(centerTextXIn(label, 6, SLEEP_L0, SLEEP_L1), 22);
-    dma_display->print(label);
+  // Round 94ish — Jon: "it doesnt seem to be picking up events that
+  // encroach on the sleep schedule... just have a quick title where it
+  // says no events near[by]... obviously scrolling is permitted if its
+  // long." Two things fixed here: (1) the label used to be silently
+  // character-truncated to fit — including "NO EVENTS NEARBY" itself,
+  // which is exactly why Jon saw it clipped to "NO EVENTS NEAR" — now it
+  // scrolls instead via drawSleepLabel(); (2) when both a late and an
+  // early event exist, each now gets its own full hold-scroll-hold slot
+  // back to back (sleepAlarmRequiredTime() sums both), instead of a fixed
+  // 2.6s wall-clock swap that could cut a long title off mid-scroll.
+  const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
+  if (lateIdx >= 0 && earlyIdx >= 0) {
+    String lateLabel = sleepAlarm.nearbyEvents[lateIdx].label; lateLabel.toUpperCase();
+    String earlyLabel = sleepAlarm.nearbyEvents[earlyIdx].label; earlyLabel.toUpperCase();
+    unsigned long lateCycle = sleepLabelTickerCycleMs(lateLabel, maxW);
+    unsigned long earlyCycle = sleepLabelTickerCycleMs(earlyLabel, maxW);
+    unsigned long t = elapsed % (lateCycle + earlyCycle);
+    if (t < lateCycle) drawSleepLabel(lateLabel, SLEEP_L0, SLEEP_L1, 22, t, lateColor);
+    else drawSleepLabel(earlyLabel, SLEEP_L0, SLEEP_L1, 22, t - lateCycle, earlyColor);
+  } else if (lateIdx >= 0) {
+    String label = sleepAlarm.nearbyEvents[lateIdx].label; label.toUpperCase();
+    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), lateColor);
+  } else if (earlyIdx >= 0) {
+    String label = sleepAlarm.nearbyEvents[earlyIdx].label; label.toUpperCase();
+    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), earlyColor);
   } else {
-    dma_display->setTextColor(dma_display->color565(100, 100, 100));
     String none = "NO EVENTS NEARBY";
-    const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
-    while ((int)none.length() * 6 > maxW && none.length() > 0) none = none.substring(0, none.length() - 1);
-    dma_display->setCursor(centerTextXIn(none, 6, SLEEP_L0, SLEEP_L1), 22);
-    dma_display->print(none);
+    drawSleepLabel(none, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(none, maxW), dma_display->color565(100, 100, 100));
   }
 
-  for (int y = 2; y < 30; y++) dma_display->drawPixel(SLEEP_MID, y, dma_display->color565(55, 60, 80));
+  // Round 94ish — divider widened 1px -> 3px per Jon.
+  dma_display->fillRect(SLEEP_MID - 1, 2, 3, 28, dma_display->color565(55, 60, 80));
 
   // Same white->gold pulse convention as the Twin (lerp3([255,255,255],
   // [255,200,110], pulse)) — red channel stays pinned at 255 throughout.
+  // Driven off `elapsed` (not absolute `now`) like every other data
+  // screen's own animation (renderWakeUp, renderCommuteStats, etc.) —
+  // round 94ish switched this whole function from `now` to `elapsed`.
   String alarmStr = minutesToClockStr(timeToMinutes(sleepAlarm.nextAlarm));
-  float pulse = ((sin(now / 900.0) + 1) / 2.0) * 0.35;
+  float pulse = ((sin(elapsed / 900.0) + 1) / 2.0) * 0.35;
   uint8_t ag = (uint8_t)round(255 + (200 - 255) * pulse);
   uint8_t ab = (uint8_t)round(255 + (110 - 255) * pulse);
   dma_display->setTextSize(2);
@@ -2546,45 +2639,59 @@ void renderCommuteStats(unsigned long elapsed) {
   const int TOP_Y0 = 0, TOP_Y1 = 19;
   const int TICKER_X0 = 4, TICKER_X1 = W - 4, TICKER_Y = 23;
 
-  // ---- top band: MIN DRIVE / KM DRIVEN, centered as one group (same
-  // "two stats side by side" shape as Weather's temp/hi-lo pairing) ----
+  // ---- top band: MIN / KM, label beside each number instead of stacked
+  // below it (round 95ish) — Jon: "the commute stats are cut of near the
+  // top, we need to compact it. we can put the labels next to the stat
+  // numbers with some spacing between the two stats. instead of stacked
+  // vertically." Root cause of the cutoff: the old stacked layout's total
+  // height (bigH + labelGap + label's own 7px) was 23px, taller than the
+  // 19px top band itself, so numY landed negative and the number drew off
+  // the top edge of the screen. Side-by-side only ever needs the number's
+  // own height, so it fits the band with room to spare.
+  //
+  // Labels shortened to "MIN"/"KM" (from "MIN DRIVE"/"KM DRIVEN") — not
+  // asked for, but necessary to make "next to the number, both stats side
+  // by side" actually fit: at full length, two number+label pairs plus a
+  // gap between them run past the panel's 192px width even on an ordinary
+  // day's numbers. "23 MIN" / "18.4 KM" reads the same, same "the number
+  // does the work, the label just names the unit" idea navigation apps
+  // use, and comfortably fits even on a heavy 3-digit-minute day.
   String minText = String(commuteStatsDriveMin);
   String kmText = String(commuteStatsKm, 1);
   const int bigSize = 2, bigH = 7 * bigSize;
-  const int labelGap = 2;
-  const char *minLabel = "MIN DRIVE";
-  const char *kmLabel = "KM DRIVEN";
+  const int numLabelGap = 4;
+  const char *minLabel = "MIN";
+  const char *kmLabel = "KM";
   int minW = (int)minText.length() * 6 * bigSize;
   int kmW = (int)kmText.length() * 6 * bigSize;
   int minLabelW = (int)strlen(minLabel) * 6;
   int kmLabelW = (int)strlen(kmLabel) * 6;
-  int blockAW = max(minW, minLabelW);
-  int blockBW = max(kmW, kmLabelW);
+  int blockAW = minW + numLabelGap + minLabelW;
+  int blockBW = kmW + numLabelGap + kmLabelW;
   const int blockGap = 16;
   int groupW = blockAW + blockGap + blockBW;
   int groupX0 = TICKER_X0 + max(0, ((TICKER_X1 - TICKER_X0) - groupW) / 2);
-  int stackH = bigH + labelGap + 7;
   int topCenterY = (TOP_Y0 + TOP_Y1) / 2;
-  int numY = topCenterY - stackH / 2;
-  int labelY = numY + bigH + labelGap;
+  int numY = topCenterY - bigH / 2;
+  int labelY = topCenterY - 7 / 2; // label text is 7px tall (size 1) — center it against the number
 
   dma_display->setTextSize(bigSize);
   dma_display->setTextColor(dma_display->color565(255, 255, 255));
-  dma_display->setCursor(groupX0 + max(0, (blockAW - minW) / 2), numY);
+  dma_display->setCursor(groupX0, numY);
   dma_display->print(minText);
   dma_display->setTextSize(1);
   dma_display->setTextColor(dma_display->color565(150, 150, 150));
-  dma_display->setCursor(groupX0 + max(0, (blockAW - minLabelW) / 2), labelY);
+  dma_display->setCursor(groupX0 + minW + numLabelGap, labelY);
   dma_display->print(minLabel);
 
   int blockBX0 = groupX0 + blockAW + blockGap;
   dma_display->setTextSize(bigSize);
   dma_display->setTextColor(dma_display->color565(255, 255, 255));
-  dma_display->setCursor(blockBX0 + max(0, (blockBW - kmW) / 2), numY);
+  dma_display->setCursor(blockBX0, numY);
   dma_display->print(kmText);
   dma_display->setTextSize(1);
   dma_display->setTextColor(dma_display->color565(150, 150, 150));
-  dma_display->setCursor(blockBX0 + max(0, (blockBW - kmLabelW) / 2), labelY);
+  dma_display->setCursor(blockBX0 + kmW + numLabelGap, labelY);
   dma_display->print(kmLabel);
 
   // ---- bottom band: the DeepSeek insight line, scrolling ----
@@ -3337,8 +3444,11 @@ void renderScreen(String id, unsigned long screenElapsed, unsigned long now) {
   else if (id == "commutestats") { if (hasCommuteStats) renderCommuteStats(screenElapsed); else renderComingSoonFwd(id, now); }
   // Round 91 — Sleep & Alarm renderer is self-gating (renderSleepAlarm()
   // shows its own "coming soon" card when sleepAlarm.hasData is false), so
-  // no hasWeather-style check needed here.
-  else if (id == "sleep") renderSleepAlarm(now);
+  // no hasWeather-style check needed here. Round 94ish added a second
+  // param: screenElapsed now drives the nearby-event ticker/pulse the same
+  // way every other data screen's animation works, while `now` still goes
+  // straight through to renderComingSoonFwd when there's no data yet.
+  else if (id == "sleep") renderSleepAlarm(screenElapsed, now);
   // Round 91 — Wake Up Mode is a real, fully animated renderer now (Jon:
   // "Im confident you can code the animation, id really like to see it on
   // the pi"). screenElapsed drives it (not `now`/millis()) so the sunrise
@@ -3557,6 +3667,14 @@ void loop() {
     if (currentScreenId == "commutestats" && targetId != "commutestats") {
       unsigned long needed = max((unsigned long)ROTATION_MS, commuteStatsRequiredTime());
       if (now - currentScreenStart < needed) targetId = "commutestats";
+    }
+    // Sleep & Alarm — round 94ish, same extension as Commute Stats above:
+    // a long nearby-event title (or a late+early pair, each with its own
+    // slot) can easily need longer than one fixed rotation slot to finish
+    // scrolling through.
+    if (currentScreenId == "sleep" && targetId != "sleep") {
+      unsigned long needed = max((unsigned long)ROTATION_MS, sleepAlarmRequiredTime());
+      if (now - currentScreenStart < needed) targetId = "sleep";
     }
   }
 
