@@ -259,8 +259,20 @@ DayOverviewData dayOverview;
 #define MAX_SLEEP_EVENTS 4
 struct SleepEvent {
   String label;
-  String time;   // "HH:MM", 24h
+  String time;   // "HH:MM", 24h — start time
   String period; // "late" or "early"
+  // Round 96ish — Jon: "the display is goofy asf, its like a little
+  // plus. I need at least a similar thing to the timeline that is roughly
+  // representative of start and end time. in the correct colour from
+  // calendars too." dur/cal added so renderSleepAlarm() can draw a real
+  // start-to-end segment in the event's actual calendar color, same as
+  // renderEvents()'s own timeline bar, instead of a single-instant dot in
+  // a generic late/early color. Never used in a function signature (only
+  // ever a plain array member of SleepAlarmData below), so adding fields
+  // here carries none of the auto-prototype struct-hoisting risk
+  // ScreenTypes.h/WakeupTypes.h exist to work around.
+  int dur = 30;  // minutes — falls back to 30 when the backend doesn't know a real end time, same convention as EventItem.dur
+  String cal;    // calendar swatch — same values calColor() already knows (see EventItem.cal)
 };
 struct SleepAlarmData {
   bool hasData = false;
@@ -1274,6 +1286,8 @@ void pollData() {
             se.label = ev["label"] | "";
             se.time = ev["time"] | "00:00";
             se.period = ev["period"] | "early";
+            se.dur = ev["dur"] | 30;
+            se.cal = ev["cal"] | "";
           }
         }
       }
@@ -2299,14 +2313,31 @@ void renderSleepAlarm(unsigned long elapsed, unsigned long now) {
   int sleepX1 = barX0 + (int)round(sleepWindowFrac(wakeMin) * (barX1 - barX0));
   dma_display->fillRect(sleepX0, barY, max(1, sleepX1 - sleepX0), barH, dma_display->color565(90, 100, 190));
 
-  const uint16_t lateColor = dma_display->color565(170, 130, 255);
-  const uint16_t earlyColor = dma_display->color565(255, 180, 80);
+  // Round 96ish — Jon: "the display is goofy asf, its like a little plus.
+  // I need at least a similar thing to the timeline that is roughly
+  // representative of start and end time. in the correct colour from
+  // calendars too." A 1px fillCircle reads as a plus/cross at this scale,
+  // and only ever marked the event's start instant — throwing away its
+  // real duration — painted in a generic late/early purple/orange instead
+  // of the event's actual calendar color. Replaced with the same
+  // start-to-end segment treatment renderEvents()'s own timeline bar
+  // already gives every event (calColorFallback(), see its own comment
+  // above) — just placed on this bar's own scale (sleepWindowFrac())
+  // instead of the Events screen's full-day one. "period" (late/early)
+  // still only decides which event(s) get shown/cycled below — the color
+  // comes straight from the calendar now, not from that classification.
   int lateIdx = -1, earlyIdx = -1;
   for (int i = 0; i < sleepAlarm.numNearbyEvents; i++) {
-    int evX = barX0 + (int)round(sleepWindowFrac(timeToMinutes(sleepAlarm.nearbyEvents[i].time)) * (barX1 - barX0));
-    dma_display->fillCircle(evX, barY + barH / 2, 1, sleepAlarm.nearbyEvents[i].period == "late" ? lateColor : earlyColor);
-    if (sleepAlarm.nearbyEvents[i].period == "late" && lateIdx < 0) lateIdx = i;
-    if (sleepAlarm.nearbyEvents[i].period == "early" && earlyIdx < 0) earlyIdx = i;
+    const SleepEvent &ev = sleepAlarm.nearbyEvents[i];
+    int startMin = timeToMinutes(ev.time);
+    int endMin = startMin + (ev.dur > 0 ? ev.dur : 30);
+    int ex0raw = barX0 + (int)round(sleepWindowFrac(startMin) * (barX1 - barX0));
+    int ex1raw = barX0 + (int)round(sleepWindowFrac(endMin) * (barX1 - barX0));
+    int ex1 = max(ex0raw + 2, ex1raw); // every event gets at least a visible sliver, same as renderEvents()
+    int dx0 = max(barX0, ex0raw), dx1 = min(ex1, barX1);
+    dma_display->fillRect(dx0, barY, max(1, dx1 - dx0), barH, calColorFallback(ev.cal, ""));
+    if (ev.period == "late" && lateIdx < 0) lateIdx = i;
+    if (ev.period == "early" && earlyIdx < 0) earlyIdx = i;
   }
 
   // Round 94ish — Jon: "it doesnt seem to be picking up events that
@@ -2319,6 +2350,9 @@ void renderSleepAlarm(unsigned long elapsed, unsigned long now) {
   // early event exist, each now gets its own full hold-scroll-hold slot
   // back to back (sleepAlarmRequiredTime() sums both), instead of a fixed
   // 2.6s wall-clock swap that could cut a long title off mid-scroll.
+  // Round 96ish — label color now matches the segment it belongs to
+  // (calColorFallback on that event's own "cal"), not a fixed late/early
+  // purple/orange, per Jon's "in the correct colour from calendars too."
   const int maxW = (SLEEP_L1 - SLEEP_L0) - 4;
   if (lateIdx >= 0 && earlyIdx >= 0) {
     String lateLabel = sleepAlarm.nearbyEvents[lateIdx].label; lateLabel.toUpperCase();
@@ -2326,14 +2360,14 @@ void renderSleepAlarm(unsigned long elapsed, unsigned long now) {
     unsigned long lateCycle = sleepLabelTickerCycleMs(lateLabel, maxW);
     unsigned long earlyCycle = sleepLabelTickerCycleMs(earlyLabel, maxW);
     unsigned long t = elapsed % (lateCycle + earlyCycle);
-    if (t < lateCycle) drawSleepLabel(lateLabel, SLEEP_L0, SLEEP_L1, 22, t, lateColor);
-    else drawSleepLabel(earlyLabel, SLEEP_L0, SLEEP_L1, 22, t - lateCycle, earlyColor);
+    if (t < lateCycle) drawSleepLabel(lateLabel, SLEEP_L0, SLEEP_L1, 22, t, calColorFallback(sleepAlarm.nearbyEvents[lateIdx].cal, ""));
+    else drawSleepLabel(earlyLabel, SLEEP_L0, SLEEP_L1, 22, t - lateCycle, calColorFallback(sleepAlarm.nearbyEvents[earlyIdx].cal, ""));
   } else if (lateIdx >= 0) {
     String label = sleepAlarm.nearbyEvents[lateIdx].label; label.toUpperCase();
-    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), lateColor);
+    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), calColorFallback(sleepAlarm.nearbyEvents[lateIdx].cal, ""));
   } else if (earlyIdx >= 0) {
     String label = sleepAlarm.nearbyEvents[earlyIdx].label; label.toUpperCase();
-    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), earlyColor);
+    drawSleepLabel(label, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(label, maxW), calColorFallback(sleepAlarm.nearbyEvents[earlyIdx].cal, ""));
   } else {
     String none = "NO EVENTS NEARBY";
     drawSleepLabel(none, SLEEP_L0, SLEEP_L1, 22, elapsed % sleepLabelTickerCycleMs(none, maxW), dma_display->color565(100, 100, 100));
