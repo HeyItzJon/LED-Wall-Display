@@ -83,7 +83,7 @@ bool timeSynced = false;
 // ---- Panel/chain configuration (matches your working setup) ----
 #define PANEL_RES_X 64
 #define PANEL_RES_Y 32
-#define PANEL_CHAIN 3   // 3 panels chained = 192x32 total
+#define PANEL_CHAIN 4   // 4 panels chained = 256x32 total
 
 // ---- Pin configuration ----
 // SEENGREAT "RGB Matrix Adapter Board (E)" plugged into an
@@ -122,7 +122,7 @@ bool timeSynced = false;
 // in case your board is that earlier revision instead of V2.x:
 //   R1=37 G1=6 B1=36 R2=35 G2=5 B2=0  A=45 B=1 C=48 D=2  E=-1 LAT=38 OE=21 CLK=47
 
-#define W (PANEL_RES_X * PANEL_CHAIN)  // 192
+#define W (PANEL_RES_X * PANEL_CHAIN)  // 256
 #define H (PANEL_RES_Y)                // 32
 
 MatrixPanel_I2S_DMA *dma_display = nullptr;
@@ -508,12 +508,21 @@ const float WAKEUP_LABEL_ALPHA = 0.55f;        // faint — never full brightnes
 
 // Fixed points (not random) — same 9 the Twin uses, kept out of the sun's
 // bottom-right landing spot and the top-left corner label. (WakeupStar
-// itself is defined in WakeupTypes.h — see that file's comment.)
+// itself is defined in WakeupTypes.h — see that file's comment.) X values
+// are laid out against a 192px reference board (the 3-panel width these
+// were designed on) and scaled to the real W at draw time — see
+// wakeupStarX() below — so a wider chain (round 96, 4th panel) fills the
+// whole new sky instead of leaving the star field pinned to the old
+// left-192px and the added width bare.
+#define WAKEUP_STARS_REF_W 192
 const WakeupStar WAKEUP_STARS[9] = {
   { 22,  5,  0,    2600 }, { 60,  10, 1450, 3100 }, { 96,  4,  2600, 2400 },
   { 128, 14, 500,  3400 }, { 145, 20, 1950, 2900 }, { 40,  18, 950,  2700 },
   { 78,  22, 2100, 3000 }, { 165, 9,  300,  2500 }, { 110, 25, 1600, 3300 },
 };
+int wakeupStarX(const WakeupStar &star) {
+  return (int)round(star.x * (float)W / (float)WAKEUP_STARS_REF_W);
+}
 // "Quick rise, slower decay" twinkle curve — same shape as the boot
 // sequence's spark field, reads as an actual twinkle rather than a smooth
 // symmetric sine.
@@ -1479,24 +1488,29 @@ void renderPortfolio(unsigned long now) {
   dma_display->clearScreen();
 
   if (hasMarketOpen) {
+    // Dot sits 5px in from the right edge, whatever the panel chain's
+    // total width is — was hardcoded to the literal 192-wide board's
+    // right edge (187), which pinned the dot mid-screen instead of at
+    // the edge the moment PANEL_CHAIN changed (round 96, 4th panel).
+    const int dotX = W - 5;
     if (marketOpen) {
       float pulse = ((sin(now / 260.0) + 1) / 2.0) * 255; // full sweep — goes completely dark at the trough
-      dma_display->fillCircle(187, 4, 2, dma_display->color565(0, (uint8_t)pulse, 0));
+      dma_display->fillCircle(dotX, 4, 2, dma_display->color565(0, (uint8_t)pulse, 0));
       String liveLabel = "LIVE";
       dma_display->setTextSize(1);
       dma_display->setTextColor(dma_display->color565(120, 120, 120));
-      dma_display->setCursor(187 - 2 - 2 - (int)liveLabel.length() * 6, 1);
+      dma_display->setCursor(dotX - 2 - 2 - (int)liveLabel.length() * 6, 1);
       dma_display->print(liveLabel);
     } else {
       // Static — no pulse/blink, unlike LIVE — same muted gray label,
       // mirrored to the left of the dot the same way (round 73, Jon:
       // "I need closed written next to it, similar to the live except
       // without any of the blinking").
-      dma_display->fillCircle(187, 4, 2, dma_display->color565(255, 40, 40));
+      dma_display->fillCircle(dotX, 4, 2, dma_display->color565(255, 40, 40));
       String closedLabel = "CLOSED";
       dma_display->setTextSize(1);
       dma_display->setTextColor(dma_display->color565(120, 120, 120));
-      dma_display->setCursor(187 - 2 - 2 - (int)closedLabel.length() * 6, 1);
+      dma_display->setCursor(dotX - 2 - 2 - (int)closedLabel.length() * 6, 1);
       dma_display->print(closedLabel);
     }
   }
@@ -2463,7 +2477,7 @@ void renderWakeUp(unsigned long t) {
       if (alpha <= 0.01f) continue;
       float rowF = (float)s.y / (float)(H - 1);
       RGBf bg = lerp3f(top, bot, rowF);
-      dma_display->drawPixel(s.x, s.y, packRGBf(lerp3f(bg, rgbf(255, 255, 255), alpha)));
+      dma_display->drawPixel(wakeupStarX(s), s.y, packRGBf(lerp3f(bg, rgbf(255, 255, 255), alpha)));
     }
   }
 
